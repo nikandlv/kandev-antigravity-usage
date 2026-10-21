@@ -342,6 +342,52 @@ func TestHandleAction_FilterInstance(t *testing.T) {
 	require.Equal(t, "kurtis", usageResp.Profiles[0].Profile.InstanceName)
 }
 
+func TestHandleAction_EnabledInstancesFilter(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
+	host := &fakeHost{
+		config: map[string]any{"agx_dir": agxDir},
+	}
+	p.SetHost(host)
+
+	queried := make(map[string]bool)
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		for _, e := range env {
+			if len(e) > 5 && e[:5] == "HOME=" {
+				queried[filepath.Base(e[5:])] = true
+			}
+		}
+		return []byte(sampleAgyJSON), nil
+	}
+
+	// Only enable "kurtis", leaving "jim" disabled
+	body, _ := json.Marshal(map[string]any{"instances": []string{"kurtis"}})
+	resp, err := p.HandleAction(context.Background(), &pluginsdk.PluginActionRequest{
+		ActionKey: ActionProfilesUsage,
+		Context:   pluginsdk.VerifiedActionContext{WorkspaceID: "ws-1"},
+		Body:      body,
+	})
+	require.NoError(t, err)
+
+	var usageResp UsageResponse
+	require.NoError(t, json.Unmarshal(resp.Body, &usageResp))
+	require.Len(t, usageResp.Profiles, 2)
+
+	// Verify only kurtis was queried with agy
+	require.True(t, queried["kurtis"], "kurtis must be queried")
+	require.False(t, queried["jim"], "jim must NOT be queried")
+
+	// Verify jim profile returned as disabled
+	for _, pu := range usageResp.Profiles {
+		if pu.Profile.InstanceName == "jim" {
+			require.Equal(t, "Disabled for Kandev", pu.Description)
+			require.Empty(t, pu.Groups)
+		} else if pu.Profile.InstanceName == "kurtis" {
+			require.NotEmpty(t, pu.Groups)
+		}
+	}
+}
+
 func TestHandleWebhook_Usage(t *testing.T) {
 	agxDir := createMockAgxDir(t)
 	p := newAntigravityUsagePlugin()

@@ -331,3 +331,85 @@ test("refetches when cache is older than 10 minutes", async () => {
   const spinners = findNodes(rendered, "Spinner");
   assert.ok(spinners.length > 0, "Should show loading spinner when cache is expired (>10 minutes)");
 });
+
+test("loads without cache for the first time without crash, saves cache, and does not loop", async () => {
+  const ls = {
+    _data: {},
+    getItem(k) {
+      return this._data[k] || null;
+    },
+    setItem(k, v) {
+      this._data[k] = String(v);
+    },
+  };
+
+  const stateValues = [];
+  let stateIndex = 0;
+  const effects = [];
+
+  const React = {
+    useState(initial) {
+      const idx = stateIndex++;
+      if (stateValues[idx] === undefined) {
+        stateValues[idx] = typeof initial === "function" ? initial() : initial;
+      }
+      const setState = (val) => {
+        stateValues[idx] = typeof val === "function" ? val(stateValues[idx]) : val;
+      };
+      return [stateValues[idx], setState];
+    },
+    useEffect(fn, deps) {
+      // In real React, [] deps only registers effect on mount
+      if (!this._mounted) {
+        effects.push(fn);
+      }
+    },
+    useCallback(fn) {
+      return fn;
+    },
+    useMemo(fn) {
+      return fn();
+    },
+    _mounted: false,
+    _reset() {
+      stateIndex = 0;
+    },
+  };
+
+  const loaded = await loadPlugin({ localStorageMock: ls, React });
+  const Page = loaded.routes[0].component;
+
+  // Initial render (no cache): shows loading indicator
+  let rendered = Page();
+  const spinners = findNodes(rendered, "Spinner");
+  assert.ok(spinners.length > 0, "First load without cache must show loading spinner");
+
+  // Run mount effect
+  React._mounted = true;
+  for (const eff of effects) {
+    eff();
+  }
+  // Wait for async loadUsage to complete
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Verify fetch was triggered
+  assert.ok(loaded.invokedActions.length > 0, "Must fetch usage on initial load when cache is missing");
+
+  // Verify cache was saved
+  assert.ok(ls.getItem("kandev_antigravity_usage_cache"), "Usage cache must be populated after initial fetch");
+
+  // Re-render: should render successfully with loaded data and no infinite loops
+  React._reset();
+  rendered = Page();
+  assert.ok(rendered, "Component must render successfully with fetched data");
+
+  // Subsequent load with the newly saved cache: should NOT fetch again
+  const secondLoad = await loadPlugin({ localStorageMock: ls });
+  const SecondPage = secondLoad.routes[0].component;
+  const secondRendered = SecondPage();
+  assert.equal(secondLoad.invokedActions.length, 0, "Subsequent load with cache must not invoke any actions");
+  const secondH1 = findNodes(secondRendered, "h1");
+  assert.equal(secondH1.length, 1);
+  assert.equal(secondH1[0].children[0], "Antigravity Usage");
+});
+

@@ -213,6 +213,10 @@ function makeAntigravityUsagePage(host) {
     const [viewMode, setViewMode] = React.useState("cards"); // 'cards' | 'table'
     const [error, setError] = React.useState(null);
 
+    const dataRef = React.useMemo(() => ({ current: null }), []);
+    dataRef.current = data;
+    const hasFetchedOnMount = React.useMemo(() => ({ current: false }), []);
+
     // Read Kandev's agent-profile store to seed default enable/disable state
     const kandevAgentProfiles = React.useMemo(() => {
       try {
@@ -380,8 +384,8 @@ function makeAntigravityUsagePage(host) {
         if (!isManual) {
           const cached = getStoredCache();
           if (cached && cached.data) {
-            setData(cached.data);
-            setCachedAt(cached.cachedAt);
+            setData((prev) => prev || cached.data);
+            setCachedAt((prev) => prev || cached.cachedAt);
             setLoading(false);
             return;
           }
@@ -398,7 +402,7 @@ function makeAntigravityUsagePage(host) {
             "";
 
           // Discover profiles to know which ones are currently enabled
-          let knownProfiles = (data?.profiles || []).map((p) => p.profile?.instance_name).filter(Boolean);
+          let knownProfiles = (dataRef.current?.profiles || []).map((p) => p.profile?.instance_name).filter(Boolean);
           if (knownProfiles.length === 0 && workspaceId && api && typeof api.invokeAction === "function") {
             try {
               const listRes = await api.invokeAction("profiles.list", { workspaceId });
@@ -468,15 +472,16 @@ function makeAntigravityUsagePage(host) {
           setRefreshing(false);
         }
       },
-      [api, context, toast, data, kandevAgentProfiles],
+      [api, context, toast, kandevAgentProfiles],
     );
 
     React.useEffect(() => {
       // If we don't have fresh cached data, fetch on mount
-      if (!initialCache) {
+      if (!initialCache && !hasFetchedOnMount.current) {
+        hasFetchedOnMount.current = true;
         loadUsage(false);
       }
-    }, [loadUsage, initialCache]);
+    }, []);
 
     const profiles = data?.profiles || [];
     const aggregates = data?.aggregates || [];
@@ -493,16 +498,16 @@ function makeAntigravityUsagePage(host) {
 
     // Aggregate summary cards
     const geminiWeeklyAgg = aggregates.find(
-      (a) => a.group_name.includes("Gemini") && a.window === "weekly",
+      (a) => a?.group_name?.includes("Gemini") && a?.window === "weekly",
     );
     const gemini5hAgg = aggregates.find(
-      (a) => a.group_name.includes("Gemini") && a.window === "5h",
+      (a) => a?.group_name?.includes("Gemini") && a?.window === "5h",
     );
     const claudeWeeklyAgg = aggregates.find(
-      (a) => a.group_name.includes("Claude") && a.window === "weekly",
+      (a) => a?.group_name?.includes("Claude") && a?.window === "weekly",
     );
     const claude5hAgg = aggregates.find(
-      (a) => a.group_name.includes("Claude") && a.window === "5h",
+      (a) => a?.group_name?.includes("Claude") && a?.window === "5h",
     );
 
     // Render switch helper (uses host.ui.Switch or fallback input)
@@ -697,7 +702,7 @@ function makeAntigravityUsagePage(host) {
                   h(
                     "div",
                     { className: "space-y-3" },
-                    g.buckets.map((b) => {
+                    (g.buckets || []).map((b) => {
                       const status = getQuotaStatus(b.remaining_percent, b.disabled);
                       const resetDesc = formatResetTime(b.reset_time);
                       return h(
@@ -778,8 +783,8 @@ function makeAntigravityUsagePage(host) {
               const isEnabled = isProfileEnabled(prof.instance_name);
               const isAgentRefreshing = Boolean(refreshingAgents[prof.instance_name]);
 
-              const geminiGroup = (pu.groups || []).find((g) => g.name.includes("Gemini"));
-              const claudeGroup = (pu.groups || []).find((g) => g.name.includes("Claude"));
+              const geminiGroup = (pu.groups || []).find((g) => g?.name?.includes("Gemini"));
+              const claudeGroup = (pu.groups || []).find((g) => g?.name?.includes("Claude"));
 
               const gWeekly = geminiGroup?.buckets?.find((b) => b.window === "weekly");
               const g5h = geminiGroup?.buckets?.find((b) => b.window === "5h");

@@ -168,6 +168,27 @@ func TestDiscoverProfiles(t *testing.T) {
 	require.Equal(t, "https://example.com/kurtis.svg", profiles[1].Avatar)
 }
 
+func TestDiscoverProfiles_LiveSystem(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	agxDir := filepath.Join(home, ".agx")
+	if _, err := os.Stat(agxDir); os.IsNotExist(err) {
+		t.Skip("~/.agx not found on this machine")
+	}
+
+	p := newAntigravityUsagePlugin()
+	profiles, err := p.discoverProfiles(agxDir)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(profiles), 6)
+
+	names := make(map[string]bool)
+	for _, prof := range profiles {
+		names[prof.InstanceName] = true
+	}
+	for _, expected := range []string{"jim", "keith", "kurtis", "ramon", "rdj", "roy"} {
+		require.True(t, names[expected], "profile %s must be discovered", expected)
+	}
+}
+
 func TestFetchUsageForProfile_Success(t *testing.T) {
 	p := newAntigravityUsagePlugin()
 	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {

@@ -35,8 +35,12 @@ const CHECK_PATH = "M20 6L9 17l-5-5";
 const INFO_PATH = "M12 16v-4M12 8h.01M12 21a9 9 0 100-18 9 9 0 000 18z";
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers & Cache constants
 // ---------------------------------------------------------------------------
+const CACHE_KEY = "kandev_antigravity_usage_cache";
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes cache
+const PROFILE_STATUS_KEY = "kandev_antigravity_profile_status";
+
 function formatResetTime(isoStr) {
   if (!isoStr) return "";
   const resetMs = new Date(isoStr).getTime();
@@ -74,11 +78,98 @@ function getQuotaStatus(percent, disabled) {
   return { label: "Healthy", color: "text-emerald-600 dark:text-emerald-400", badgeVariant: "default" };
 }
 
+function getStoredProfileStatus() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(PROFILE_STATUS_KEY);
+      if (raw) return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.warn("Failed to read profile status from storage:", e);
+  }
+  return {};
+}
+
+function saveStoredProfileStatus(statusMap) {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(PROFILE_STATUS_KEY, JSON.stringify(statusMap));
+    }
+  } catch (e) {
+    console.warn("Failed to save profile status to storage:", e);
+  }
+}
+
+function getStoredCache() {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const raw = localStorage.getItem(CACHE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && parsed.cachedAt && parsed.data) {
+        if (Date.now() - parsed.cachedAt < CACHE_TTL_MS) {
+          return parsed;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("Failed to read usage cache:", e);
+  }
+  return null;
+}
+
+function saveStoredCache(data) {
+  try {
+    if (typeof localStorage !== "undefined" && data) {
+      localStorage.setItem(
+        CACHE_KEY,
+        JSON.stringify({ data, cachedAt: Date.now() }),
+      );
+    }
+  } catch (e) {
+    console.warn("Failed to write usage cache:", e);
+  }
+}
+
+function computeClientAggregates(profiles) {
+  const stats = {};
+  for (const pu of profiles || []) {
+    if (pu.error || !pu.groups || pu.groups.length === 0) continue;
+    for (const g of pu.groups) {
+      for (const b of g.buckets || []) {
+        const key = `${g.name}|${b.window}|${b.name}`;
+        if (!stats[key]) {
+          stats[key] = {
+            group_name: g.name,
+            window: b.window,
+            bucket_name: b.name,
+            sumFraction: 0,
+            count: 0,
+          };
+        }
+        stats[key].count += 1;
+        stats[key].sumFraction += b.disabled ? 0 : (b.remaining_fraction || 0);
+      }
+    }
+  }
+  return Object.values(stats).map((s) => {
+    const avg = s.count > 0 ? s.sumFraction / s.count : 0;
+    return {
+      group_name: s.group_name,
+      window: s.window,
+      bucket_name: s.bucket_name,
+      instances: s.count,
+      avg_remaining: avg,
+      avg_percent: Math.round(avg * 100),
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Main Page Component
 // ---------------------------------------------------------------------------
 function makeAntigravityUsagePage(host) {
-  const { jsx: h, ui, toast, utils, api, context } = host;
+  const { jsx: h, ui, toast, utils, api, context, store } = host;
   const {
     Button,
     Card,
@@ -91,7 +182,6 @@ function makeAntigravityUsagePage(host) {
     Input,
     Spinner,
     Empty,
-    EmptyContent,
     EmptyDescription,
     EmptyHeader,
     EmptyMedia,
@@ -105,67 +195,288 @@ function makeAntigravityUsagePage(host) {
     TableHead,
     TableHeader,
     TableRow,
+    Switch,
   } = ui;
 
   return function AntigravityUsagePage() {
     const React = host.React;
-    const [data, setData] = React.useState(null);
-    const [loading, setLoading] = React.useState(true);
+
+    // Load initial cache synchronously if valid (<10m old)
+    const initialCache = React.useMemo(() => getStoredCache(), []);
+    const [data, setData] = React.useState(() => initialCache?.data || null);
+    const [cachedAt, setCachedAt] = React.useState(() => initialCache?.cachedAt || null);
+    const [loading, setLoading] = React.useState(() => !initialCache);
     const [refreshing, setRefreshing] = React.useState(false);
+    const [refreshingAgents, setRefreshingAgents] = React.useState({});
+    const [profileStatus, setProfileStatus] = React.useState(() => getStoredProfileStatus());
     const [searchQuery, setSearchQuery] = React.useState("");
     const [viewMode, setViewMode] = React.useState("cards"); // 'cards' | 'table'
     const [error, setError] = React.useState(null);
 
-    const loadUsage = React.useCallback(async (isManual = false) => {
-      if (isManual) setRefreshing(true);
-      else setLoading(true);
-      setError(null);
-
+    // Read Kandev's agent-profile store to seed default enable/disable state
+    const kandevAgentProfiles = React.useMemo(() => {
       try {
-        const workspaceId =
-          (context && typeof context.getActiveWorkspaceId === "function" && context.getActiveWorkspaceId()) ||
-          (context && typeof context.getWorkspaceIds === "function" && context.getWorkspaceIds()?.[0]) ||
-          "";
-
-        let result = null;
-        if (workspaceId && api && typeof api.invokeAction === "function") {
-          try {
-            result = await api.invokeAction("profiles.usage", { workspaceId });
-          } catch (invokeErr) {
-            console.warn("invokeAction profiles.usage failed, falling back to webhook:", invokeErr);
-          }
-        }
-
-        if (!result && api && typeof api.fetch === "function") {
-          const res = await api.fetch("/webhooks/usage", { method: "POST" });
-          if (res.ok) {
-            result = await res.json();
-          }
-        }
-
-        if (result && !result.error) {
-          setData(result);
-          if (isManual) {
-            toast.success("Antigravity usage quotas refreshed");
-          }
-        } else {
-          const errMsg = (result && result.error) || "Failed to load agent usage";
-          setError(errMsg);
-          if (isManual) toast.error(errMsg);
-        }
-      } catch (err) {
-        const msg = err.message || "Failed to communicate with usage service";
-        setError(msg);
-        if (isManual) toast.error(msg);
-      } finally {
-        setLoading(false);
-        setRefreshing(false);
+        const state = store && typeof store.getState === "function" ? store.getState() : null;
+        return state?.agentProfiles?.items || [];
+      } catch (_) {
+        return [];
       }
-    }, [api, context, toast]);
+    }, [store]);
+
+    const isProfileEnabled = React.useCallback(
+      (instanceName) => {
+        if (!instanceName) return true;
+        const key = instanceName.toLowerCase();
+        if (typeof profileStatus[key] === "boolean") {
+          return profileStatus[key];
+        }
+        const matched = kandevAgentProfiles.find(
+          (ap) => (ap.name || "").toLowerCase() === key || (ap.agent_name || "").toLowerCase() === key,
+        );
+        if (matched && typeof matched.enabled === "boolean") {
+          return matched.enabled;
+        }
+        return true;
+      },
+      [profileStatus, kandevAgentProfiles],
+    );
+
+    // Refresh a single agent profile
+    const refreshSingleProfile = React.useCallback(
+      async (instanceName) => {
+        if (!instanceName) return;
+        setRefreshingAgents((prev) => ({ ...prev, [instanceName]: true }));
+
+        try {
+          const workspaceId =
+            (context && typeof context.getActiveWorkspaceId === "function" && context.getActiveWorkspaceId()) ||
+            (context && typeof context.getWorkspaceIds === "function" && context.getWorkspaceIds()?.[0]) ||
+            "";
+
+          const payload = { instance: instanceName };
+          let result = null;
+
+          if (workspaceId && api && typeof api.invokeAction === "function") {
+            try {
+              result = await api.invokeAction("profiles.usage", {
+                workspaceId,
+                body: JSON.stringify(payload),
+              });
+            } catch (invokeErr) {
+              console.warn("invokeAction single profile failed, falling back to webhook:", invokeErr);
+            }
+          }
+
+          if (!result && api && typeof api.fetch === "function") {
+            const res = await api.fetch("/webhooks/usage", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            });
+            if (res.ok) {
+              result = await res.json();
+            }
+          }
+
+          if (result && !result.error && result.profiles && result.profiles.length > 0) {
+            const updated = result.profiles[0];
+            setData((prev) => {
+              if (!prev) return prev;
+              const existing = prev.profiles || [];
+              let found = false;
+              const nextProfiles = existing.map((p) => {
+                if (p.profile?.instance_name?.toLowerCase() === instanceName.toLowerCase()) {
+                  found = true;
+                  return updated;
+                }
+                return p;
+              });
+              if (!found) nextProfiles.push(updated);
+
+              const nextAggs = computeClientAggregates(nextProfiles);
+              const nextData = {
+                ...prev,
+                profiles: nextProfiles,
+                aggregates: nextAggs,
+                fetched_at: new Date().toISOString(),
+              };
+              saveStoredCache(nextData);
+              return nextData;
+            });
+            toast.success(`Refreshed ${instanceName} usage`);
+          } else {
+            const errMsg = result?.error || `Failed to refresh ${instanceName}`;
+            toast.error(errMsg);
+          }
+        } catch (err) {
+          toast.error(err.message || `Failed to refresh ${instanceName}`);
+        } finally {
+          setRefreshingAgents((prev) => ({ ...prev, [instanceName]: false }));
+        }
+      },
+      [api, context, toast],
+    );
+
+    // Toggle profile enable/disable for Kandev
+    const toggleProfile = React.useCallback(
+      async (instanceName, nextEnabled) => {
+        const key = instanceName.toLowerCase();
+        const nextStatus = { ...profileStatus, [key]: nextEnabled };
+        setProfileStatus(nextStatus);
+        saveStoredProfileStatus(nextStatus);
+
+        // Attempt to sync to Kandev's agent profile endpoint if available
+        const matched = kandevAgentProfiles.find(
+          (ap) => (ap.name || "").toLowerCase() === key || (ap.agent_name || "").toLowerCase() === key,
+        );
+        if (matched && matched.id && typeof window !== "undefined" && typeof window.fetch === "function") {
+          try {
+            await window.fetch(`/api/v1/agent-profiles/${matched.id}`, {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ enabled: nextEnabled }),
+            });
+          } catch (err) {
+            console.warn("Could not sync agent profile enabled state to Kandev API:", err);
+          }
+        }
+
+        toast.success(
+          `Profile "${instanceName}" ${nextEnabled ? "enabled" : "disabled"} for Kandev`,
+        );
+
+        if (nextEnabled) {
+          refreshSingleProfile(instanceName);
+        } else {
+          setData((prev) => {
+            if (!prev) return prev;
+            const updatedProfiles = (prev.profiles || []).map((pu) => {
+              if (pu.profile?.instance_name?.toLowerCase() === key) {
+                return {
+                  ...pu,
+                  groups: [],
+                  description: "Disabled for Kandev",
+                };
+              }
+              return pu;
+            });
+            const updatedAggs = computeClientAggregates(updatedProfiles);
+            const nextData = {
+              ...prev,
+              profiles: updatedProfiles,
+              aggregates: updatedAggs,
+            };
+            saveStoredCache(nextData);
+            return nextData;
+          });
+        }
+      },
+      [profileStatus, kandevAgentProfiles, refreshSingleProfile, toast],
+    );
+
+    // Full load / refresh: only fetches enabled profiles
+    const loadUsage = React.useCallback(
+      async (isManual = false) => {
+        if (!isManual) {
+          const cached = getStoredCache();
+          if (cached && cached.data) {
+            setData(cached.data);
+            setCachedAt(cached.cachedAt);
+            setLoading(false);
+            return;
+          }
+        }
+
+        if (isManual) setRefreshing(true);
+        else setLoading(true);
+        setError(null);
+
+        try {
+          const workspaceId =
+            (context && typeof context.getActiveWorkspaceId === "function" && context.getActiveWorkspaceId()) ||
+            (context && typeof context.getWorkspaceIds === "function" && context.getWorkspaceIds()?.[0]) ||
+            "";
+
+          // Discover profiles to know which ones are currently enabled
+          let knownProfiles = (data?.profiles || []).map((p) => p.profile?.instance_name).filter(Boolean);
+          if (knownProfiles.length === 0 && workspaceId && api && typeof api.invokeAction === "function") {
+            try {
+              const listRes = await api.invokeAction("profiles.list", { workspaceId });
+              if (listRes?.profiles) {
+                knownProfiles = listRes.profiles.map((p) => p.instance_name);
+              }
+            } catch (_) {}
+          }
+
+          const currentStatus = getStoredProfileStatus();
+          const enabledList = knownProfiles.filter((name) => {
+            const key = name.toLowerCase();
+            if (typeof currentStatus[key] === "boolean") return currentStatus[key];
+            const matched = kandevAgentProfiles.find(
+              (ap) => (ap.name || "").toLowerCase() === key || (ap.agent_name || "").toLowerCase() === key,
+            );
+            if (matched && typeof matched.enabled === "boolean") return matched.enabled;
+            return true;
+          });
+
+          const filterBody = {
+            instances: enabledList.length > 0 ? enabledList : undefined,
+          };
+
+          let result = null;
+          if (workspaceId && api && typeof api.invokeAction === "function") {
+            try {
+              result = await api.invokeAction("profiles.usage", {
+                workspaceId,
+                body: JSON.stringify(filterBody),
+              });
+            } catch (invokeErr) {
+              console.warn("invokeAction profiles.usage failed, falling back to webhook:", invokeErr);
+            }
+          }
+
+          if (!result && api && typeof api.fetch === "function") {
+            const res = await api.fetch("/webhooks/usage", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(filterBody),
+            });
+            if (res.ok) {
+              result = await res.json();
+            }
+          }
+
+          if (result && !result.error) {
+            setData(result);
+            const now = Date.now();
+            setCachedAt(now);
+            saveStoredCache(result);
+            if (isManual) {
+              toast.success("Antigravity usage quotas refreshed");
+            }
+          } else {
+            const errMsg = (result && result.error) || "Failed to load Antigravity usage";
+            setError(errMsg);
+            if (isManual) toast.error(errMsg);
+          }
+        } catch (err) {
+          const msg = err.message || "Failed to communicate with usage service";
+          setError(msg);
+          if (isManual) toast.error(msg);
+        } finally {
+          setLoading(false);
+          setRefreshing(false);
+        }
+      },
+      [api, context, toast, data, kandevAgentProfiles],
+    );
 
     React.useEffect(() => {
-      loadUsage(false);
-    }, [loadUsage]);
+      // If we don't have fresh cached data, fetch on mount
+      if (!initialCache) {
+        loadUsage(false);
+      }
+    }, [loadUsage, initialCache]);
 
     const profiles = data?.profiles || [];
     const aggregates = data?.aggregates || [];
@@ -194,17 +505,40 @@ function makeAntigravityUsagePage(host) {
       (a) => a.group_name.includes("Claude") && a.window === "5h",
     );
 
+    // Render switch helper (uses host.ui.Switch or fallback input)
+    function renderProfileSwitch({ instanceName, isEnabled }) {
+      if (Switch) {
+        return h(Switch, {
+          checked: isEnabled,
+          onCheckedChange: (checked) => toggleProfile(instanceName, checked),
+          "aria-label": `Enable ${instanceName} for Kandev`,
+        });
+      }
+      return h("input", {
+        type: "checkbox",
+        checked: isEnabled,
+        onChange: (e) => toggleProfile(instanceName, e.target.checked),
+        "aria-label": `Enable ${instanceName} for Kandev`,
+        className: "h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary cursor-pointer",
+      });
+    }
+
     // Profile card renderer
     function renderProfileCard(pu) {
       const prof = pu.profile || {};
       const groups = pu.groups || [];
       const hasError = Boolean(pu.error);
+      const isEnabled = isProfileEnabled(prof.instance_name);
+      const isAgentRefreshing = Boolean(refreshingAgents[prof.instance_name]);
 
       return h(
         Card,
         {
           key: prof.instance_name,
-          className: "flex flex-col border shadow-sm transition hover:shadow-md",
+          className: utils.cn(
+            "flex flex-col border shadow-sm transition hover:shadow-md",
+            !isEnabled && "opacity-80 bg-muted/10 border-dashed",
+          ),
         },
         h(
           CardHeader,
@@ -214,12 +548,12 @@ function makeAntigravityUsagePage(host) {
             { className: "flex items-start justify-between gap-3" },
             h(
               "div",
-              { className: "flex items-center gap-3" },
+              { className: "flex items-center gap-3 min-w-0" },
               prof.avatar
                 ? h("img", {
                     src: prof.avatar,
                     alt: prof.instance_name,
-                    className: "h-9 w-9 rounded-full border bg-muted/30 p-0.5 object-cover",
+                    className: "h-9 w-9 rounded-full border bg-muted/30 p-0.5 object-cover shrink-0",
                     onError: (e) => {
                       e.target.style.display = "none";
                     },
@@ -228,19 +562,21 @@ function makeAntigravityUsagePage(host) {
                     "div",
                     {
                       className:
-                        "flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-primary font-bold text-sm",
+                        "flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary font-bold text-sm",
                     },
                     (prof.instance_name || "A").substring(0, 2).toUpperCase(),
                   ),
               h(
                 "div",
-                null,
+                { className: "min-w-0" },
                 h(
                   "div",
-                  { className: "flex items-center gap-2" },
-                  h(CardTitle, { className: "text-base font-semibold" }, prof.instance_name),
+                  { className: "flex items-center gap-2 flex-wrap" },
+                  h(CardTitle, { className: "text-base font-semibold truncate" }, prof.instance_name),
                   hasError
                     ? h(Badge, { variant: "destructive", className: "text-xs" }, "Error")
+                    : !isEnabled
+                    ? h(Badge, { variant: "secondary", className: "text-xs font-normal" }, "Disabled in Kandev")
                     : h(
                         Badge,
                         { variant: "outline", className: "text-xs font-normal" },
@@ -249,8 +585,62 @@ function makeAntigravityUsagePage(host) {
                 ),
                 h(
                   CardDescription,
-                  { className: "text-xs mt-0.5 text-muted-foreground" },
+                  { className: "text-xs mt-0.5 text-muted-foreground truncate" },
                   prof.homeDir || `~/.agx/${prof.instance_name}`,
+                ),
+              ),
+            ),
+            h(
+              "div",
+              { className: "flex items-center gap-2 shrink-0" },
+              // Single agent refresh button
+              h(
+                Tooltip,
+                null,
+                h(
+                  TooltipTrigger,
+                  { asChild: true },
+                  h(
+                    Button,
+                    {
+                      variant: "ghost",
+                      size: "icon",
+                      className: "h-8 w-8 cursor-pointer text-muted-foreground hover:text-foreground",
+                      disabled: isAgentRefreshing || !isEnabled,
+                      onClick: () => refreshSingleProfile(prof.instance_name),
+                      "aria-label": `Refresh ${prof.instance_name} usage`,
+                    },
+                    isAgentRefreshing
+                      ? h(Spinner, { className: "h-3.5 w-3.5" })
+                      : icon(h, REFRESH_PATH, 14),
+                  ),
+                ),
+                h(
+                  TooltipContent,
+                  null,
+                  isEnabled ? `Refresh ${prof.instance_name} usage` : "Enable profile to refresh",
+                ),
+              ),
+              // Kandev enable/disable toggle
+              h(
+                Tooltip,
+                null,
+                h(
+                  TooltipTrigger,
+                  { asChild: true },
+                  h(
+                    "div",
+                    { className: "flex items-center" },
+                    renderProfileSwitch({
+                      instanceName: prof.instance_name,
+                      isEnabled,
+                    }),
+                  ),
+                ),
+                h(
+                  TooltipContent,
+                  null,
+                  isEnabled ? "Enabled for Kandev (click to disable)" : "Disabled for Kandev (click to enable)",
                 ),
               ),
             ),
@@ -268,6 +658,32 @@ function makeAntigravityUsagePage(host) {
                 },
                 icon(h, ALERT_PATH, 16, "shrink-0 mt-0.5"),
                 h("span", null, pu.error),
+              )
+            : !isEnabled
+            ? h(
+                "div",
+                { className: "rounded-lg border border-dashed bg-muted/10 p-5 text-center space-y-2" },
+                h(
+                  "p",
+                  { className: "text-xs text-muted-foreground" },
+                  "Profile disabled for Kandev. Live quotas are not fetched.",
+                ),
+                h(
+                  Button,
+                  {
+                    size: "sm",
+                    variant: "outline",
+                    onClick: () => toggleProfile(prof.instance_name, true),
+                    className: "text-xs cursor-pointer",
+                  },
+                  "Enable for Kandev",
+                ),
+              )
+            : groups.length === 0
+            ? h(
+                "div",
+                { className: "p-4 text-center text-xs text-muted-foreground" },
+                "No quota groups returned.",
               )
             : groups.map((g) =>
                 h(
@@ -345,11 +761,13 @@ function makeAntigravityUsagePage(host) {
               null,
               h(TableHead, null, "Instance"),
               h(TableHead, null, "Role"),
+              h(TableHead, null, "Kandev"),
               h(TableHead, null, "Gemini (Weekly)"),
               h(TableHead, null, "Gemini (5-Hour)"),
               h(TableHead, null, "Claude/GPT (Weekly)"),
               h(TableHead, null, "Claude/GPT (5-Hour)"),
-              h(TableHead, { className: "text-right" }, "Status"),
+              h(TableHead, null, "Status"),
+              h(TableHead, { className: "text-right" }, "Actions"),
             ),
           ),
           h(
@@ -357,6 +775,9 @@ function makeAntigravityUsagePage(host) {
             null,
             filteredProfiles.map((pu) => {
               const prof = pu.profile || {};
+              const isEnabled = isProfileEnabled(prof.instance_name);
+              const isAgentRefreshing = Boolean(refreshingAgents[prof.instance_name]);
+
               const geminiGroup = (pu.groups || []).find((g) => g.name.includes("Gemini"));
               const claudeGroup = (pu.groups || []).find((g) => g.name.includes("Claude"));
 
@@ -367,7 +788,7 @@ function makeAntigravityUsagePage(host) {
 
               return h(
                 TableRow,
-                { key: prof.instance_name },
+                { key: prof.instance_name, className: !isEnabled ? "opacity-75" : "" },
                 h(
                   TableCell,
                   { className: "font-semibold text-sm flex items-center gap-2" },
@@ -390,8 +811,18 @@ function makeAntigravityUsagePage(host) {
                 h(TableCell, { className: "text-muted-foreground text-xs" }, prof.role || "Agent"),
                 h(
                   TableCell,
+                  null,
+                  renderProfileSwitch({
+                    instanceName: prof.instance_name,
+                    isEnabled,
+                  }),
+                ),
+                h(
+                  TableCell,
                   { className: "text-xs" },
-                  gWeekly
+                  !isEnabled
+                    ? "—"
+                    : gWeekly
                     ? h(
                         "span",
                         { className: getQuotaStatus(gWeekly.remaining_percent, gWeekly.disabled).color },
@@ -402,7 +833,9 @@ function makeAntigravityUsagePage(host) {
                 h(
                   TableCell,
                   { className: "text-xs" },
-                  g5h
+                  !isEnabled
+                    ? "—"
+                    : g5h
                     ? h(
                         "span",
                         { className: getQuotaStatus(g5h.remaining_percent, g5h.disabled).color },
@@ -413,7 +846,9 @@ function makeAntigravityUsagePage(host) {
                 h(
                   TableCell,
                   { className: "text-xs" },
-                  cWeekly
+                  !isEnabled
+                    ? "—"
+                    : cWeekly
                     ? h(
                         "span",
                         { className: getQuotaStatus(cWeekly.remaining_percent, cWeekly.disabled).color },
@@ -424,7 +859,9 @@ function makeAntigravityUsagePage(host) {
                 h(
                   TableCell,
                   { className: "text-xs" },
-                  c5h
+                  !isEnabled
+                    ? "—"
+                    : c5h
                     ? h(
                         "span",
                         { className: getQuotaStatus(c5h.remaining_percent, c5h.disabled).color },
@@ -434,12 +871,45 @@ function makeAntigravityUsagePage(host) {
                 ),
                 h(
                   TableCell,
-                  { className: "text-right" },
+                  null,
                   pu.error
                     ? h(Badge, { variant: "destructive" }, "Error")
+                    : !isEnabled
+                    ? h(Badge, { variant: "secondary" }, "Disabled")
                     : gWeekly?.disabled || gWeekly?.remaining_percent === 0
                     ? h(Badge, { variant: "destructive" }, "Depleted")
                     : h(Badge, { variant: "default" }, "Active"),
+                ),
+                h(
+                  TableCell,
+                  { className: "text-right" },
+                  h(
+                    Tooltip,
+                    null,
+                    h(
+                      TooltipTrigger,
+                      { asChild: true },
+                      h(
+                        Button,
+                        {
+                          variant: "ghost",
+                          size: "icon",
+                          className: "h-7 w-7 cursor-pointer",
+                          disabled: isAgentRefreshing || !isEnabled,
+                          onClick: () => refreshSingleProfile(prof.instance_name),
+                          "aria-label": `Refresh ${prof.instance_name}`,
+                        },
+                        isAgentRefreshing
+                          ? h(Spinner, { className: "h-3.5 w-3.5" })
+                          : icon(h, REFRESH_PATH, 13),
+                      ),
+                    ),
+                    h(
+                      TooltipContent,
+                      null,
+                      isEnabled ? `Refresh ${prof.instance_name}` : "Enable profile to refresh",
+                    ),
+                  ),
                 ),
               );
             }),
@@ -447,6 +917,8 @@ function makeAntigravityUsagePage(host) {
         ),
       );
     }
+
+    const enabledCount = profiles.filter((p) => isProfileEnabled(p.profile?.instance_name)).length;
 
     return h(
       "div",
@@ -459,11 +931,11 @@ function makeAntigravityUsagePage(host) {
         h(
           "div",
           null,
-          h("h1", { className: "text-2xl font-bold tracking-tight text-foreground" }, "Antigravity Agent Usage"),
+          h("h1", { className: "text-2xl font-bold tracking-tight text-foreground" }, "Antigravity Usage"),
           h(
             "p",
             { className: "text-sm text-muted-foreground mt-0.5" },
-            "Monitor live usage quotas, 5-hour throttles, and weekly refresh limits across all Antigravity agent profiles.",
+            "Monitor live usage quotas, 5-hour throttles, and weekly refresh limits across Antigravity agent profiles.",
           ),
         ),
         h(
@@ -494,7 +966,7 @@ function makeAntigravityUsagePage(host) {
               size: "sm",
               disabled: loading || refreshing,
               onClick: () => loadUsage(true),
-              className: "flex items-center gap-1.5",
+              className: "flex items-center gap-1.5 cursor-pointer",
             },
             refreshing
               ? h(Spinner, { className: "h-3.5 w-3.5" })
@@ -516,7 +988,7 @@ function makeAntigravityUsagePage(host) {
           h(
             "p",
             { className: "text-xs text-muted-foreground mt-1" },
-            `${profiles.filter((p) => !p.error).length} active, ${profiles.filter((p) => p.error).length} errors`,
+            `${enabledCount} enabled for Kandev, ${profiles.length - enabledCount} disabled`,
           ),
         ),
         h(
@@ -557,7 +1029,7 @@ function makeAntigravityUsagePage(host) {
       // Search & Filter Bar
       h(
         "div",
-        { className: "flex items-center gap-3" },
+        { className: "flex items-center gap-3 flex-wrap justify-between" },
         h(
           "div",
           { className: "relative flex-1 max-w-sm" },
@@ -574,13 +1046,31 @@ function makeAntigravityUsagePage(host) {
             className: "pl-9 text-sm",
           }),
         ),
-        data?.fetched_at
-          ? h(
-              "span",
-              { className: "text-xs text-muted-foreground hidden sm:inline" },
-              `Updated: ${utils.formatRelativeTime ? utils.formatRelativeTime(data.fetched_at) : new Date(data.fetched_at).toLocaleTimeString()}`,
-            )
-          : null,
+        h(
+          "div",
+          { className: "flex items-center gap-2 text-xs text-muted-foreground" },
+          cachedAt
+            ? h(
+                Badge,
+                { variant: "secondary", className: "text-[11px] font-normal" },
+                `Cached (10m TTL) • ${
+                  utils?.formatRelativeTime
+                    ? utils.formatRelativeTime(new Date(cachedAt).toISOString())
+                    : new Date(cachedAt).toLocaleTimeString()
+                }`,
+              )
+            : data?.fetched_at
+            ? h(
+                "span",
+                null,
+                `Updated: ${
+                  utils?.formatRelativeTime
+                    ? utils.formatRelativeTime(data.fetched_at)
+                    : new Date(data.fetched_at).toLocaleTimeString()
+                }`,
+              )
+            : null,
+        ),
       ),
 
       // Error Banner
@@ -599,7 +1089,7 @@ function makeAntigravityUsagePage(host) {
             "div",
             { className: "flex flex-col items-center justify-center py-16 space-y-3" },
             h(Spinner, { className: "h-8 w-8 text-primary" }),
-            h("p", { className: "text-sm text-muted-foreground" }, "Fetching Antigravity agent quotas..."),
+            h("p", { className: "text-sm text-muted-foreground" }, "Fetching Antigravity quotas..."),
           )
         : filteredProfiles.length === 0
         ? h(
@@ -688,7 +1178,7 @@ window.registerKandevPlugin("kandev-antigravity-usage", {
   initialize(registry, host) {
     registry.registerNavItem({
       id: "antigravity-usage",
-      label: "Agent Usage",
+      label: "Antigravity Usage",
       path: "/antigravity-usage",
       icon: "gauge",
       section: "main",

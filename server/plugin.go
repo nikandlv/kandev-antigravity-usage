@@ -137,13 +137,19 @@ func (p *antigravityUsagePlugin) HandleAction(ctx context.Context, req *pluginsd
 
 	case ActionProfilesUsage:
 		var filter struct {
-			Instance string `json:"instance"`
+			Instance         string   `json:"instance"`
+			Instances        []string `json:"instances"`
+			EnabledInstances []string `json:"enabled_instances"`
 		}
 		if len(req.Body) > 0 {
 			_ = json.Unmarshal(req.Body, &filter)
 		}
+		enabledList := filter.Instances
+		if len(enabledList) == 0 {
+			enabledList = filter.EnabledInstances
+		}
 
-		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, filter.Instance)
+		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, filter.Instance, enabledList)
 		respBytes, err := json.Marshal(usageResp)
 		if err != nil {
 			return nil, fmt.Errorf("marshalling usage response: %w", err)
@@ -168,7 +174,19 @@ func (p *antigravityUsagePlugin) HandleWebhook(ctx context.Context, req *plugins
 	case WebhookUsage:
 		agxDir := p.resolveAgxDir(ctx)
 		agyBin := p.resolveAgyBin(ctx)
-		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, "")
+		var filter struct {
+			Instance         string   `json:"instance"`
+			Instances        []string `json:"instances"`
+			EnabledInstances []string `json:"enabled_instances"`
+		}
+		if len(req.Body) > 0 {
+			_ = json.Unmarshal(req.Body, &filter)
+		}
+		enabledList := filter.Instances
+		if len(enabledList) == 0 {
+			enabledList = filter.EnabledInstances
+		}
+		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, filter.Instance, enabledList)
 		body, err := json.Marshal(usageResp)
 		if err != nil {
 			return nil, fmt.Errorf("marshalling usage response: %w", err)
@@ -409,7 +427,7 @@ func cleanEnvForProfile(homeDir string) []string {
 }
 
 // fetchAllUsages retrieves usage for all or filtered profiles.
-func (p *antigravityUsagePlugin) fetchAllUsages(ctx context.Context, agxDir, agyBin string, filterInstance string) UsageResponse {
+func (p *antigravityUsagePlugin) fetchAllUsages(ctx context.Context, agxDir, agyBin string, filterInstance string, enabledInstances []string) UsageResponse {
 	fetchedAt := time.Now().UTC().Format(time.RFC3339)
 	profiles, err := p.discoverProfiles(agxDir)
 	if err != nil {
@@ -436,6 +454,12 @@ func (p *antigravityUsagePlugin) fetchAllUsages(ctx context.Context, agxDir, agy
 		profiles = matched
 	}
 
+	enabledSet := make(map[string]bool)
+	for _, inst := range enabledInstances {
+		enabledSet[strings.ToLower(strings.TrimSpace(inst))] = true
+	}
+	hasEnabledFilter := len(enabledSet) > 0 && filterInstance == ""
+
 	// Fetch concurrently
 	results := make([]ProfileUsage, len(profiles))
 	var wg sync.WaitGroup
@@ -444,6 +468,15 @@ func (p *antigravityUsagePlugin) fetchAllUsages(ctx context.Context, agxDir, agy
 	sem := make(chan struct{}, 6)
 
 	for i, prof := range profiles {
+		if hasEnabledFilter && !enabledSet[strings.ToLower(prof.InstanceName)] {
+			results[i] = ProfileUsage{
+				Profile:     prof,
+				Description: "Disabled for Kandev",
+				FetchedAt:   fetchedAt,
+			}
+			continue
+		}
+
 		wg.Add(1)
 		go func(idx int, pi ProfileInfo) {
 			defer wg.Done()

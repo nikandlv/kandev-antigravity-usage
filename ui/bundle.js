@@ -1,123 +1,12 @@
-// kandev plugin UI bundle — the frontend half of this plugin.
+// kandev-antigravity-usage UI bundle — the frontend half of the plugin.
 //
-// This is a hand-written, NO-BUILD plain-JS ES module. It ships byte-for-byte
-// inside the package tar.gz under ui/bundle.js, and kandev serves it directly
-// from the extracted package at GET /api/plugins/<id>/ui/bundle.js, then
-// dynamically imports it as a native ES module. There is nothing to build:
-// edit this file and repackage (`make package` / `make package-host`).
-//
-// The contract, in three touch points:
-//   - window.registerKandevPlugin(id, { initialize, destroy }) is the single
-//     global entry point the host calls once this module has been evaluated.
-//     `id` MUST match manifest.yaml's id.
-//   - The `host` object handed to initialize() carries the SHARED host React
-//     instance (`host.React`, `host.jsx` == host.React.createElement) plus a
-//     curated design system (`host.ui`), imperative toasts (`host.toast`),
-//     shared helpers (`host.utils`), the live theme (`host.theme` /
-//     `host.onThemeChange`), provider-neutral context (`host.context`), and
-//     navigation (`host.navigate`). NEVER import or bundle your own React —
-//     that breaks hook identity across the host tree. The same goes for
-//     recharts: use the `host.ui.Chart*` wrappers, because a second copy splits the
-//     context its tooltips and legends resolve through, exactly like React.
-//   - `registry` is where you declare nav items, routes, slot components,
-//     providers, task actions, review surfaces, and WS handlers. Every
-//     registration is tracked under this plugin's id, so
-//     the host bulk-unregisters everything when the plugin is disabled.
-//
-// `host.ui` is much broader than the few components used below — Accordion*,
-// Collapsible*, Select*, Tabs*, Sheet*, Pagination*, ScrollArea, Skeleton,
-// Switch, the Chart* recharts wrappers, and kandev's own PageTopbar,
-// Combobox and TaskCreateDialog are all there. Reach for one before
-// hand-rolling: a styled <div> progress bar or a getBoundingClientRect
-// popover will drift from the app around it. The authoritative list is
-// `apps/web/lib/plugins/host-api.ts` (`PLUGIN_UI`) in the kandev repo.
-//
-// Everything in this file is meant to be deleted piece by piece. The page
-// below is one Card built from independent parts — Popover, Progress, Table,
-// Empty — each of which can be removed without touching the others.
-//
-// Rename "kandev-plugin-template" below to your plugin id, then keep / delete
-// registrations to match what your plugin actually contributes.
+// Plain ES module executed inside the kandev SPA without an iframe.
+// Uses host.React, host.jsx, and host.ui design system components.
 
 // ---------------------------------------------------------------------------
-// A tiny module-level pub/sub holding the most recent task.created deliveries.
-// Kept outside any component so the list survives route navigation and is
-// shared by every subscriber. Delete this if you don't register a WS handler.
+// Inline SVG icons
 // ---------------------------------------------------------------------------
-
-// How many deliveries we keep. Also the denominator of the Progress bar below,
-// which is the honest thing for it to show: how full this buffer is.
-const RECENT_LIMIT = 5;
-
-let recentTasks = []; // newest first, capped at RECENT_LIMIT
-const recentListeners = new Set();
-
-function publishRecentTasks(next) {
-  recentTasks = next;
-  for (const listener of recentListeners) listener(recentTasks);
-}
-
-// recordTask turns one task.created WS payload into a row. The payload is the
-// backend's task event shape (snake_case: task_id, title, workspace_id, ...);
-// it carries no "delivered at" field, so we stamp arrival ourselves — that is
-// the timestamp the table renders through host.utils.formatRelativeTime.
-function recordTask(payload) {
-  const task = payload || {};
-  const entry = {
-    taskId: task.task_id || "unknown",
-    title: task.title || "Untitled task",
-    seenAt: new Date().toISOString(),
-  };
-  publishRecentTasks([entry, ...recentTasks].slice(0, RECENT_LIMIT));
-}
-
-// useRecentTasks re-renders its component whenever publishRecentTasks fires.
-// Built on host.React's useState/useEffect since this bundle can't ship its
-// own useSyncExternalStore without bundling React.
-function useRecentTasks(React) {
-  const [tasks, setTasks] = React.useState(recentTasks);
-  React.useEffect(() => {
-    // Resync first: a delivery may have landed between the initial render and
-    // this subscription.
-    setTasks(recentTasks);
-    recentListeners.add(setTasks);
-    return () => recentListeners.delete(setTasks);
-  }, []);
-  return tasks;
-}
-
-// ---------------------------------------------------------------------------
-// useHostTheme — the live light/dark theme, as component state.
-//
-// `host.theme` is a getter evaluated on every access, but `host` is built once
-// per plugin load: read it into a variable that outlives a render and you have
-// frozen it. Anything that only *styles* things can ignore this entirely —
-// every host.ui component and every Tailwind/CSS-variable class already
-// follows the theme on its own. You need this hook for the narrow case where
-// your plugin computes a color itself (canvas painting, an inline SVG fill,
-// a color passed to a chart) or, as below, displays the theme.
-//
-// Delete this together with whatever reads it.
-// ---------------------------------------------------------------------------
-function useHostTheme(host) {
-  const React = host.React;
-  const [theme, setTheme] = React.useState(host.theme);
-  React.useEffect(() => {
-    setTheme(host.theme); // resync, same reason as above
-    // onThemeChange returns its own unsubscribe — returning it straight from
-    // the effect is the whole teardown. Skipping it leaks a listener that
-    // outlives the component.
-    return host.onThemeChange(setTheme);
-  }, []);
-  return theme;
-}
-
-// ---------------------------------------------------------------------------
-// Inline SVG icons. The bundle ships no build step and can't import an icon
-// set (that would mean bundling), so glyphs are drawn by hand at 16px to match
-// first-party icons. Swap for your own.
-// ---------------------------------------------------------------------------
-function icon(h, path, size) {
+function icon(h, path, size, className) {
   return h(
     "svg",
     {
@@ -126,53 +15,90 @@ function icon(h, path, size) {
       height: size || 16,
       viewBox: "0 0 24 24",
       fill: "none",
-      stroke: "currentColor", // follows the theme with no JS — see useHostTheme
+      stroke: "currentColor",
       strokeWidth: 2,
       strokeLinecap: "round",
       strokeLinejoin: "round",
+      className: className || "",
       "aria-hidden": "true",
     },
     h("path", { d: path }),
   );
 }
 
-const STAR_PATH = "M12 2l2.9 6.3 6.9.8-5.1 4.7 1.4 6.8L12 18l-6.1 3.4 1.4-6.8L2.2 9.9l6.9-.8L12 2z";
+const GAUGE_PATH = "M12 14l4-4m-9.172 6.172a8 8 0 1 1 11.314 0M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z";
+const REFRESH_PATH = "M20 11a8.1 8.1 0 0 0-15.5-2m-.5-5v5h5M4 13a8.1 8.1 0 0 0 15.5 2m.5 5v-5h-5";
+const SEARCH_PATH = "M21 21l-6-6m2-5a7 7 0 1 1-14 0 7 7 0 0 1 14 0z";
+const USER_PATH = "M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2m8-10a4 4 0 1 0 0-8 4 4 0 0 0 0 8z";
+const ALERT_PATH = "M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4m0 4h.01";
+const CHECK_PATH = "M20 6L9 17l-5-5";
 const INFO_PATH = "M12 16v-4M12 8h.01M12 21a9 9 0 100-18 9 9 0 000 18z";
-const INBOX_PATH = "M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13l3.5 7v6a2 2 0 01-2 2H4a2 2 0 01-2-2v-6l3.5-7z";
-
-// The host renders shortcuts with the platform's own modifier glyph; match it
-// rather than hard-coding "Ctrl", which is simply wrong on macOS.
-const MOD_KEY = /Mac|iPhone|iPad/i.test((navigator && navigator.platform) || "") ? "⌘" : "Ctrl";
 
 // ---------------------------------------------------------------------------
-// A native route/page, rendered inside the kandev SPA (not an iframe) from the
-// host's own design system. The host renders its first-party title bar above
-// this page; here we contribute only the body.
+// Helpers
 // ---------------------------------------------------------------------------
-function makePluginPage(host) {
-  const { jsx: h, ui, toast, utils } = host;
+function formatResetTime(isoStr) {
+  if (!isoStr) return "";
+  const resetMs = new Date(isoStr).getTime();
+  if (isNaN(resetMs)) return "";
+
+  const diffMs = resetMs - Date.now();
+  if (diffMs <= 0) return "resets soon";
+
+  const diffSecs = Math.floor(diffMs / 1000);
+  const diffMins = Math.floor(diffSecs / 60);
+  const diffHours = Math.floor(diffMins / 60);
+  const diffDays = Math.floor(diffHours / 24);
+
+  if (diffDays > 0) {
+    const remHours = diffHours % 24;
+    return `in ${diffDays}d ${remHours}h`;
+  }
+  if (diffHours > 0) {
+    const remMins = diffMins % 60;
+    return `in ${diffHours}h ${remMins}m`;
+  }
+  return `in ${diffMins}m`;
+}
+
+function getQuotaStatus(percent, disabled) {
+  if (disabled || percent <= 0) {
+    return { label: "Depleted", color: "text-red-600 dark:text-red-400", badgeVariant: "destructive" };
+  }
+  if (percent < 25) {
+    return { label: "Low", color: "text-amber-600 dark:text-amber-400", badgeVariant: "warning" };
+  }
+  if (percent < 60) {
+    return { label: "Moderate", color: "text-blue-600 dark:text-blue-400", badgeVariant: "secondary" };
+  }
+  return { label: "Healthy", color: "text-emerald-600 dark:text-emerald-400", badgeVariant: "default" };
+}
+
+// ---------------------------------------------------------------------------
+// Main Page Component
+// ---------------------------------------------------------------------------
+function makeAntigravityUsagePage(host) {
+  const { jsx: h, ui, toast, utils, api, context } = host;
   const {
     Button,
     Card,
-    CardAction,
     CardContent,
     CardDescription,
     CardHeader,
     CardTitle,
+    Progress,
+    Badge,
+    Input,
+    Spinner,
     Empty,
+    EmptyContent,
     EmptyDescription,
     EmptyHeader,
     EmptyMedia,
     EmptyTitle,
-    Kbd,
-    KbdGroup,
-    Popover,
-    PopoverContent,
-    PopoverDescription,
-    PopoverHeader,
-    PopoverTitle,
-    PopoverTrigger,
-    Progress,
+    Tooltip,
+    TooltipTrigger,
+    TooltipContent,
     Table,
     TableBody,
     TableCell,
@@ -181,248 +107,555 @@ function makePluginPage(host) {
     TableRow,
   } = ui;
 
-  // AboutPopover — host.ui.Popover*, positioned by the host (Radix), so it
-  // flips and clamps at the viewport edge without any getBoundingClientRect
-  // math of your own. Delete this and the CardAction wrapping it together.
-  function AboutPopover() {
-    // The one thing on this page that genuinely needs a theme subscription:
-    // it prints the resolved value, so a stale read is visible as a wrong
-    // label when the user flips the theme with this popover open.
-    const theme = useHostTheme(host);
+  return function AntigravityUsagePage() {
+    const React = host.React;
+    const [data, setData] = React.useState(null);
+    const [loading, setLoading] = React.useState(true);
+    const [refreshing, setRefreshing] = React.useState(false);
+    const [searchQuery, setSearchQuery] = React.useState("");
+    const [viewMode, setViewMode] = React.useState("cards"); // 'cards' | 'table'
+    const [error, setError] = React.useState(null);
 
-    return h(
-      Popover,
-      null,
-      h(
-        PopoverTrigger,
-        { asChild: true },
-        h(
-          Button,
-          {
-            id: "template-about-trigger",
-            type: "button",
-            variant: "ghost",
-            size: "icon",
-            className: "h-7 w-7",
-            "aria-label": "About this page",
-          },
-          icon(h, INFO_PATH),
-        ),
-      ),
-      h(
-        PopoverContent,
-        { align: "end", className: "w-80" },
-        h(
-          PopoverHeader,
-          null,
-          h(PopoverTitle, null, "Where these rows come from"),
-          h(
-            PopoverDescription,
-            null,
-            "The registerWsHandler(\"task.created\", ...) call at the bottom of ",
-            "ui/bundle.js. It fires for every task created anywhere in kandev ",
-            "while this tab is open — no polling, no refetch.",
-          ),
-        ),
-        h(
-          "p",
-          { className: "text-muted-foreground mt-3 text-xs" },
-          "Create one with ",
-          // host.ui.Kbd renders a key the same way the app's own shortcut
-          // surfaces do. This is kandev's real "new task" binding.
-          h(KbdGroup, null, h(Kbd, null, MOD_KEY), h(Kbd, null, "N")),
-          " to watch a row appear.",
-        ),
-        h(
-          "p",
-          { id: "template-theme-readout", className: "text-muted-foreground mt-3 text-xs" },
-          `Host theme: ${theme}. `,
-          "Everything above follows it with no JS — host.ui components and CSS ",
-          "variables restyle themselves. Subscribe via host.onThemeChange only ",
-          "for colors you compute yourself.",
-        ),
-      ),
-    );
-  }
+    const loadUsage = React.useCallback(async (isManual = false) => {
+      if (isManual) setRefreshing(true);
+      else setLoading(true);
+      setError(null);
 
-  // RecentTasksTable / EmptyState — the two halves of the same slot. Keep
-  // whichever matches your data and delete the other; an empty state built
-  // from host.ui.Empty* costs nothing and stops your page from looking broken
-  // before its first delivery.
-  function RecentTasksTable({ tasks }) {
-    return h(
-      Table,
-      null,
-      h(
-        TableHeader,
-        null,
-        h(
-          TableRow,
-          null,
-          h(TableHead, null, "Task"),
-          h(TableHead, { className: "w-32 text-right" }, "Seen"),
-        ),
-      ),
-      h(
-        TableBody,
-        null,
-        tasks.map((task) =>
-          h(
-            TableRow,
-            { key: `${task.taskId}-${task.seenAt}` },
-            h(TableCell, { className: "font-medium" }, task.title),
-            h(
-              TableCell,
-              { className: "text-muted-foreground text-right text-xs" },
-              // host.utils.formatRelativeTime is locale-aware
-              // (Intl.RelativeTimeFormat) in the user's active locale. A
-              // hand-rolled "3 minutes ago" ladder is English-only by
-              // construction and silently untranslated for everyone else.
-              utils.formatRelativeTime(task.seenAt),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
+      try {
+        const workspaceId =
+          (context && typeof context.getActiveWorkspaceId === "function" && context.getActiveWorkspaceId()) ||
+          (context && typeof context.getWorkspaceIds === "function" && context.getWorkspaceIds()?.[0]) ||
+          "";
 
-  function EmptyState() {
-    return h(
-      Empty,
-      { id: "template-page-empty" },
-      h(
-        EmptyHeader,
-        null,
-        h(EmptyMedia, { variant: "icon" }, icon(h, INBOX_PATH)),
-        h(EmptyTitle, null, "No tasks created yet"),
-        h(
-          EmptyDescription,
-          null,
-          "This page fills in as tasks are created while it is open.",
-        ),
-      ),
-    );
-  }
+        let result = null;
+        if (workspaceId && api && typeof api.invokeAction === "function") {
+          try {
+            result = await api.invokeAction("profiles.usage", { workspaceId });
+          } catch (invokeErr) {
+            console.warn("invokeAction profiles.usage failed, falling back to webhook:", invokeErr);
+          }
+        }
 
-  return function PluginPage() {
-    const tasks = useRecentTasks(host.React);
-    const isEmpty = tasks.length === 0;
+        if (!result && api && typeof api.fetch === "function") {
+          const res = await api.fetch("/webhooks/usage", { method: "POST" });
+          if (res.ok) {
+            result = await res.json();
+          }
+        }
 
-    // One action, wired to both toast variants. host.toast is imperative — the
-    // host mounts the single <Toaster/>, so there is nothing to render and it
-    // works from anywhere, including inside host.openModal content.
-    //
-    // The button stays enabled when the buffer is empty on purpose: that is
-    // what makes the .error path reachable. toast.error renders like any other
-    // variant and logs `[plugins] toast.error from "<id>"` to the console, but
-    // deliberately files NO backend error report — kandev's error log is for
-    // kandev's own faults, not a plugin reporting an expected condition.
-    const onClear = () => {
-      if (isEmpty) {
-        toast.error("Nothing to clear yet");
-        return;
+        if (result && !result.error) {
+          setData(result);
+          if (isManual) {
+            toast.success("Antigravity usage quotas refreshed");
+          }
+        } else {
+          const errMsg = (result && result.error) || "Failed to load agent usage";
+          setError(errMsg);
+          if (isManual) toast.error(errMsg);
+        }
+      } catch (err) {
+        const msg = err.message || "Failed to communicate with usage service";
+        setError(msg);
+        if (isManual) toast.error(msg);
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
       }
-      const cleared = tasks.length;
-      publishRecentTasks([]);
-      toast.success(`Cleared ${cleared} row${cleared === 1 ? "" : "s"}`);
-    };
+    }, [api, context, toast]);
 
-    return h(
-      "div",
-      { className: "p-4 max-w-2xl" },
-      h(
+    React.useEffect(() => {
+      loadUsage(false);
+    }, [loadUsage]);
+
+    const profiles = data?.profiles || [];
+    const aggregates = data?.aggregates || [];
+
+    const filteredProfiles = React.useMemo(() => {
+      if (!searchQuery.trim()) return profiles;
+      const q = searchQuery.toLowerCase();
+      return profiles.filter(
+        (p) =>
+          p.profile?.instance_name?.toLowerCase().includes(q) ||
+          p.profile?.role?.toLowerCase().includes(q),
+      );
+    }, [profiles, searchQuery]);
+
+    // Aggregate summary cards
+    const geminiWeeklyAgg = aggregates.find(
+      (a) => a.group_name.includes("Gemini") && a.window === "weekly",
+    );
+    const gemini5hAgg = aggregates.find(
+      (a) => a.group_name.includes("Gemini") && a.window === "5h",
+    );
+    const claudeWeeklyAgg = aggregates.find(
+      (a) => a.group_name.includes("Claude") && a.window === "weekly",
+    );
+    const claude5hAgg = aggregates.find(
+      (a) => a.group_name.includes("Claude") && a.window === "5h",
+    );
+
+    // Profile card renderer
+    function renderProfileCard(pu) {
+      const prof = pu.profile || {};
+      const groups = pu.groups || [];
+      const hasError = Boolean(pu.error);
+
+      return h(
         Card,
-        null,
+        {
+          key: prof.instance_name,
+          className: "flex flex-col border shadow-sm transition hover:shadow-md",
+        },
         h(
           CardHeader,
-          null,
-          h(CardTitle, { id: "template-page-title" }, "Template plugin"),
-          h(CardDescription, null, `The ${RECENT_LIMIT} most recent tasks created since this page loaded`),
-          h(CardAction, null, h(AboutPopover)),
+          { className: "pb-3" },
+          h(
+            "div",
+            { className: "flex items-start justify-between gap-3" },
+            h(
+              "div",
+              { className: "flex items-center gap-3" },
+              prof.avatar
+                ? h("img", {
+                    src: prof.avatar,
+                    alt: prof.instance_name,
+                    className: "h-9 w-9 rounded-full border bg-muted/30 p-0.5 object-cover",
+                    onError: (e) => {
+                      e.target.style.display = "none";
+                    },
+                  })
+                : h(
+                    "div",
+                    {
+                      className:
+                        "flex h-9 w-9 items-center justify-center rounded-full bg-primary/10 text-primary font-bold text-sm",
+                    },
+                    (prof.instance_name || "A").substring(0, 2).toUpperCase(),
+                  ),
+              h(
+                "div",
+                null,
+                h(
+                  "div",
+                  { className: "flex items-center gap-2" },
+                  h(CardTitle, { className: "text-base font-semibold" }, prof.instance_name),
+                  hasError
+                    ? h(Badge, { variant: "destructive", className: "text-xs" }, "Error")
+                    : h(
+                        Badge,
+                        { variant: "outline", className: "text-xs font-normal" },
+                        prof.role || "Agent",
+                      ),
+                ),
+                h(
+                  CardDescription,
+                  { className: "text-xs mt-0.5 text-muted-foreground" },
+                  prof.homeDir || `~/.agx/${prof.instance_name}`,
+                ),
+              ),
+            ),
+          ),
         ),
         h(
           CardContent,
-          null,
-          // host.ui.Progress takes a 0-100 value. Used here for what it is
-          // actually good at: a bounded ratio. Don't reach for it to fake an
-          // indeterminate spinner — host.ui.Spinner is that.
-          h(
-            "div",
-            { className: "mb-4" },
-            h(Progress, { id: "template-page-progress", value: (tasks.length / RECENT_LIMIT) * 100 }),
-            h(
-              "p",
-              {
-                // host.utils.cn is the host's own clsx + tailwind-merge
-                // combiner, so conditional classes merge the same way they do
-                // in the components they sit next to.
-                className: utils.cn(
-                  "mt-2 text-xs",
-                  isEmpty ? "text-muted-foreground/60" : "text-muted-foreground",
+          { className: "flex-1 space-y-4 pt-1" },
+          hasError
+            ? h(
+                "div",
+                {
+                  className:
+                    "rounded-md bg-destructive/10 p-3 text-xs text-destructive flex items-start gap-2",
+                },
+                icon(h, ALERT_PATH, 16, "shrink-0 mt-0.5"),
+                h("span", null, pu.error),
+              )
+            : groups.map((g) =>
+                h(
+                  "div",
+                  { key: g.name, className: "space-y-2 rounded-lg border bg-muted/20 p-3" },
+                  h(
+                    "div",
+                    { className: "text-xs font-semibold uppercase tracking-wider text-muted-foreground" },
+                    g.name,
+                  ),
+                  h(
+                    "div",
+                    { className: "space-y-3" },
+                    g.buckets.map((b) => {
+                      const status = getQuotaStatus(b.remaining_percent, b.disabled);
+                      const resetDesc = formatResetTime(b.reset_time);
+                      return h(
+                        "div",
+                        { key: b.id, className: "space-y-1" },
+                        h(
+                          "div",
+                          { className: "flex items-center justify-between text-xs" },
+                          h(
+                            "span",
+                            { className: "font-medium text-foreground flex items-center gap-1.5" },
+                            b.name,
+                            b.disabled
+                              ? h(
+                                  Badge,
+                                  { variant: "destructive", className: "text-[10px] px-1 py-0" },
+                                  "depleted",
+                                )
+                              : null,
+                          ),
+                          h(
+                            "span",
+                            { className: utils.cn("font-bold text-xs", status.color) },
+                            b.disabled ? "0%" : `${b.remaining_percent}%`,
+                          ),
+                        ),
+                        h(Progress, {
+                          value: b.disabled ? 0 : b.remaining_percent,
+                          className: "h-2",
+                        }),
+                        resetDesc
+                          ? h(
+                              "div",
+                              { className: "flex items-center justify-between text-[11px] text-muted-foreground" },
+                              h("span", null, "Full refresh"),
+                              h("span", { className: "font-mono" }, resetDesc),
+                            )
+                          : null,
+                      );
+                    }),
+                  ),
                 ),
-              },
-              `buffer ${tasks.length} of ${RECENT_LIMIT}`,
+              ),
+        ),
+      );
+    }
+
+    // Detailed Table View
+    function renderTableView() {
+      return h(
+        Card,
+        { className: "border shadow-sm overflow-hidden" },
+        h(
+          Table,
+          null,
+          h(
+            TableHeader,
+            null,
+            h(
+              TableRow,
+              null,
+              h(TableHead, null, "Instance"),
+              h(TableHead, null, "Role"),
+              h(TableHead, null, "Gemini (Weekly)"),
+              h(TableHead, null, "Gemini (5-Hour)"),
+              h(TableHead, null, "Claude/GPT (Weekly)"),
+              h(TableHead, null, "Claude/GPT (5-Hour)"),
+              h(TableHead, { className: "text-right" }, "Status"),
             ),
           ),
-          isEmpty ? h(EmptyState) : h(RecentTasksTable, { tasks }),
           h(
-            "div",
-            { className: "mt-4 flex justify-end" },
-            h(
-              Button,
-              {
-                id: "template-page-clear",
-                type: "button",
-                variant: "outline",
-                size: "sm",
-                onClick: onClear,
-              },
-              "Clear",
-            ),
+            TableBody,
+            null,
+            filteredProfiles.map((pu) => {
+              const prof = pu.profile || {};
+              const geminiGroup = (pu.groups || []).find((g) => g.name.includes("Gemini"));
+              const claudeGroup = (pu.groups || []).find((g) => g.name.includes("Claude"));
+
+              const gWeekly = geminiGroup?.buckets?.find((b) => b.window === "weekly");
+              const g5h = geminiGroup?.buckets?.find((b) => b.window === "5h");
+              const cWeekly = claudeGroup?.buckets?.find((b) => b.window === "weekly");
+              const c5h = claudeGroup?.buckets?.find((b) => b.window === "5h");
+
+              return h(
+                TableRow,
+                { key: prof.instance_name },
+                h(
+                  TableCell,
+                  { className: "font-semibold text-sm flex items-center gap-2" },
+                  prof.avatar
+                    ? h("img", {
+                        src: prof.avatar,
+                        alt: prof.instance_name,
+                        className: "h-6 w-6 rounded-full border bg-muted/20 object-cover",
+                      })
+                    : h(
+                        "div",
+                        {
+                          className:
+                            "flex h-6 w-6 items-center justify-center rounded-full bg-primary/10 text-primary text-[10px] font-bold",
+                        },
+                        (prof.instance_name || "A").substring(0, 2).toUpperCase(),
+                      ),
+                  prof.instance_name,
+                ),
+                h(TableCell, { className: "text-muted-foreground text-xs" }, prof.role || "Agent"),
+                h(
+                  TableCell,
+                  { className: "text-xs" },
+                  gWeekly
+                    ? h(
+                        "span",
+                        { className: getQuotaStatus(gWeekly.remaining_percent, gWeekly.disabled).color },
+                        gWeekly.disabled ? "0% (Depleted)" : `${gWeekly.remaining_percent}%`,
+                      )
+                    : "—",
+                ),
+                h(
+                  TableCell,
+                  { className: "text-xs" },
+                  g5h
+                    ? h(
+                        "span",
+                        { className: getQuotaStatus(g5h.remaining_percent, g5h.disabled).color },
+                        g5h.disabled ? "0% (Depleted)" : `${g5h.remaining_percent}%`,
+                      )
+                    : "—",
+                ),
+                h(
+                  TableCell,
+                  { className: "text-xs" },
+                  cWeekly
+                    ? h(
+                        "span",
+                        { className: getQuotaStatus(cWeekly.remaining_percent, cWeekly.disabled).color },
+                        `${cWeekly.remaining_percent}%`,
+                      )
+                    : "—",
+                ),
+                h(
+                  TableCell,
+                  { className: "text-xs" },
+                  c5h
+                    ? h(
+                        "span",
+                        { className: getQuotaStatus(c5h.remaining_percent, c5h.disabled).color },
+                        `${c5h.remaining_percent}%`,
+                      )
+                    : "—",
+                ),
+                h(
+                  TableCell,
+                  { className: "text-right" },
+                  pu.error
+                    ? h(Badge, { variant: "destructive" }, "Error")
+                    : gWeekly?.disabled || gWeekly?.remaining_percent === 0
+                    ? h(Badge, { variant: "destructive" }, "Depleted")
+                    : h(Badge, { variant: "default" }, "Active"),
+                ),
+              );
+            }),
+          ),
+        ),
+      );
+    }
+
+    return h(
+      "div",
+      { className: "p-6 max-w-7xl mx-auto space-y-6" },
+
+      // Header Toolbar
+      h(
+        "div",
+        { className: "flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4" },
+        h(
+          "div",
+          null,
+          h("h1", { className: "text-2xl font-bold tracking-tight text-foreground" }, "Antigravity Agent Usage"),
+          h(
+            "p",
+            { className: "text-sm text-muted-foreground mt-0.5" },
+            "Monitor live usage quotas, 5-hour throttles, and weekly refresh limits across all Antigravity agent profiles.",
+          ),
+        ),
+        h(
+          "div",
+          { className: "flex items-center gap-2" },
+          h(
+            Button,
+            {
+              variant: viewMode === "cards" ? "secondary" : "ghost",
+              size: "sm",
+              onClick: () => setViewMode("cards"),
+            },
+            "Cards",
+          ),
+          h(
+            Button,
+            {
+              variant: viewMode === "table" ? "secondary" : "ghost",
+              size: "sm",
+              onClick: () => setViewMode("table"),
+            },
+            "Table",
+          ),
+          h(
+            Button,
+            {
+              variant: "outline",
+              size: "sm",
+              disabled: loading || refreshing,
+              onClick: () => loadUsage(true),
+              className: "flex items-center gap-1.5",
+            },
+            refreshing
+              ? h(Spinner, { className: "h-3.5 w-3.5" })
+              : icon(h, REFRESH_PATH, 14),
+            "Refresh",
           ),
         ),
       ),
+
+      // Aggregate KPI Cards
+      h(
+        "div",
+        { className: "grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4" },
+        h(
+          Card,
+          { className: "p-4 border shadow-sm" },
+          h("div", { className: "text-xs font-medium text-muted-foreground" }, "Configured Profiles"),
+          h("div", { className: "text-2xl font-bold mt-1" }, profiles.length),
+          h(
+            "p",
+            { className: "text-xs text-muted-foreground mt-1" },
+            `${profiles.filter((p) => !p.error).length} active, ${profiles.filter((p) => p.error).length} errors`,
+          ),
+        ),
+        h(
+          Card,
+          { className: "p-4 border shadow-sm" },
+          h("div", { className: "text-xs font-medium text-muted-foreground" }, "Gemini Weekly (Avg)"),
+          h(
+            "div",
+            { className: utils.cn("text-2xl font-bold mt-1", getQuotaStatus(geminiWeeklyAgg?.avg_percent ?? 0).color) },
+            geminiWeeklyAgg ? `${geminiWeeklyAgg.avg_percent}%` : "—",
+          ),
+          h(Progress, { value: geminiWeeklyAgg?.avg_percent || 0, className: "h-1.5 mt-2" }),
+        ),
+        h(
+          Card,
+          { className: "p-4 border shadow-sm" },
+          h("div", { className: "text-xs font-medium text-muted-foreground" }, "Gemini 5-Hour (Avg)"),
+          h(
+            "div",
+            { className: utils.cn("text-2xl font-bold mt-1", getQuotaStatus(gemini5hAgg?.avg_percent ?? 0).color) },
+            gemini5hAgg ? `${gemini5hAgg.avg_percent}%` : "—",
+          ),
+          h(Progress, { value: gemini5hAgg?.avg_percent || 0, className: "h-1.5 mt-2" }),
+        ),
+        h(
+          Card,
+          { className: "p-4 border shadow-sm" },
+          h("div", { className: "text-xs font-medium text-muted-foreground" }, "Claude & GPT Weekly (Avg)"),
+          h(
+            "div",
+            { className: utils.cn("text-2xl font-bold mt-1", getQuotaStatus(claudeWeeklyAgg?.avg_percent ?? 0).color) },
+            claudeWeeklyAgg ? `${claudeWeeklyAgg.avg_percent}%` : "—",
+          ),
+          h(Progress, { value: claudeWeeklyAgg?.avg_percent || 0, className: "h-1.5 mt-2" }),
+        ),
+      ),
+
+      // Search & Filter Bar
+      h(
+        "div",
+        { className: "flex items-center gap-3" },
+        h(
+          "div",
+          { className: "relative flex-1 max-w-sm" },
+          h(
+            "div",
+            { className: "absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-muted-foreground" },
+            icon(h, SEARCH_PATH, 14),
+          ),
+          h(Input, {
+            type: "text",
+            placeholder: "Search profile by name or role...",
+            value: searchQuery,
+            onChange: (e) => setSearchQuery(e.target.value),
+            className: "pl-9 text-sm",
+          }),
+        ),
+        data?.fetched_at
+          ? h(
+              "span",
+              { className: "text-xs text-muted-foreground hidden sm:inline" },
+              `Updated: ${utils.formatRelativeTime ? utils.formatRelativeTime(data.fetched_at) : new Date(data.fetched_at).toLocaleTimeString()}`,
+            )
+          : null,
+      ),
+
+      // Error Banner
+      error
+        ? h(
+            "div",
+            { className: "rounded-md border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive flex items-center justify-between" },
+            h("div", { className: "flex items-center gap-2" }, icon(h, ALERT_PATH, 16), h("span", null, error)),
+            h(Button, { size: "sm", variant: "outline", onClick: () => loadUsage(true) }, "Retry"),
+          )
+        : null,
+
+      // Main Content Area
+      loading
+        ? h(
+            "div",
+            { className: "flex flex-col items-center justify-center py-16 space-y-3" },
+            h(Spinner, { className: "h-8 w-8 text-primary" }),
+            h("p", { className: "text-sm text-muted-foreground" }, "Fetching Antigravity agent quotas..."),
+          )
+        : filteredProfiles.length === 0
+        ? h(
+            Empty,
+            null,
+            h(
+              EmptyHeader,
+              null,
+              h(EmptyMedia, { variant: "icon" }, icon(h, USER_PATH, 24)),
+              h(EmptyTitle, null, "No Antigravity profiles found"),
+              h(
+                EmptyDescription,
+                null,
+                searchQuery
+                  ? `No profiles matching "${searchQuery}".`
+                  : "No profiles found under ~/.agx. Check plugin configuration in Settings > Plugins.",
+              ),
+            ),
+          )
+        : viewMode === "cards"
+        ? h(
+            "div",
+            { className: "grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5" },
+            filteredProfiles.map(renderProfileCard),
+          )
+        : renderTableView(),
     );
   };
 }
 
 // ---------------------------------------------------------------------------
-// A component for the "chat-input-actions" slot: an icon button rendered in
-// the chat composer toolbar, beside the model picker, mic, and send. The host
-// passes { sessionId, taskId, taskTitle } as slotProps, so the button knows
-// which task/session the user is looking at.
+// Chat Composer Toolbar Action
 // ---------------------------------------------------------------------------
 function makeChatToolbarAction(host) {
   const { jsx: h, ui } = host;
   const { Button, Tooltip, TooltipTrigger, TooltipContent } = ui;
 
   return function ChatToolbarAction({ slotProps }) {
-    const ctx = slotProps || {};
-    const label = ctx.taskTitle || ctx.taskId;
-    const translate = host.i18n && host.i18n.useTranslation
-      ? host.i18n.useTranslation().t
-      : null;
+    const translate =
+      host.i18n && host.i18n.useTranslation ? host.i18n.useTranslation().t : null;
     const actionLabel = translate
-      ? translate("openTemplatePage", { defaultValue: "Template — open page" })
-      : "Template — open page";
-    const tooltip = label ? `${actionLabel} (task: ${label})` : actionLabel;
+      ? translate("openAntigravityUsage", { defaultValue: "Antigravity Usage — View agent quotas" })
+      : "Antigravity Usage — View agent quotas";
 
-    // Action owns the shell and tooltip on supported hosts. Keep one legacy
-    // path for hosts that predate Action; both paths keep the same registration.
+    const tooltip = actionLabel;
+
     if (typeof ui.Action === "function") {
       return h(ui.Action, {
-        id: "template-chat-action",
+        id: "antigravity-usage-chat-action",
         label: actionLabel,
-        icon: icon(h, STAR_PATH),
+        icon: icon(h, GAUGE_PATH),
         tooltip,
-        onClick: () => host.navigate("/template"),
+        onClick: () => host.navigate("/antigravity-usage"),
       });
     }
 
-    // A plain Tooltip needs no provider of your own: the app shell mounts one,
-    // and host.openModal content gets its own, so this works inside a plugin
-    // modal too. host.ui.TooltipProvider is exported only for when you want a
-    // custom delayDuration over a dense cluster of tooltips.
     return h(
       Tooltip,
       null,
@@ -432,15 +665,15 @@ function makeChatToolbarAction(host) {
         h(
           Button,
           {
-            id: "template-chat-action",
+            id: "antigravity-usage-chat-action",
             type: "button",
             variant: "ghost",
             size: "icon",
             className: "h-7 w-7 cursor-pointer hover:bg-muted/40",
             "aria-label": tooltip,
-            onClick: () => host.navigate("/template"),
+            onClick: () => host.navigate("/antigravity-usage"),
           },
-          icon(h, STAR_PATH),
+          icon(h, GAUGE_PATH),
         ),
       ),
       h(TooltipContent, null, tooltip),
@@ -449,40 +682,26 @@ function makeChatToolbarAction(host) {
 }
 
 // ---------------------------------------------------------------------------
-// Registration. Keep only what your plugin uses.
+// Plugin Registration
 // ---------------------------------------------------------------------------
-window.registerKandevPlugin("kandev-plugin-template", {
+window.registerKandevPlugin("kandev-antigravity-usage", {
   initialize(registry, host) {
-    // A sidebar entry. `icon` is a curated host icon name; it also becomes the
-    // default topbar icon for the route registered on the same path.
     registry.registerNavItem({
-      id: "template",
-      label: "Template",
-      path: "/template",
-      icon: "puzzle",
+      id: "antigravity-usage",
+      label: "Agent Usage",
+      path: "/antigravity-usage",
+      icon: "gauge",
       section: "main",
     });
 
-    // A native route. The topbar title/icon default to the nav item above;
-    // here we add a subtitle. Pass { topbar: false } to own the whole page
-    // chrome yourself (host.ui.PageTopbar is available for that).
-    registry.registerRoute("/template", makePluginPage(host), {
-      topbar: { subtitle: "A starter kandev plugin page" },
+    registry.registerRoute("/antigravity-usage", makeAntigravityUsagePage(host), {
+      topbar: { subtitle: "Antigravity Agent Quotas & Limits" },
     });
 
-    // A WS handler: fires for every task.created message the SPA receives,
-    // regardless of which component is mounted, since the buffer lives at
-    // module scope. Register handlers only for events you actually use.
-    registry.registerWsHandler("task.created", recordTask);
-
-    // A chat-composer toolbar button.
     registry.registerComponent("chat-input-actions", makeChatToolbarAction(host));
   },
 
   destroy() {
-    // The host bulk-unregisters everything under this plugin's id; reset local
-    // module state too so a re-enable starts clean.
-    publishRecentTasks([]);
-    recentListeners.clear();
+    // Teardown logic if needed
   },
 });

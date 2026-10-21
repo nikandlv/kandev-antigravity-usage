@@ -1,4 +1,4 @@
-module kandev-plugin-template
+module kandev-antigravity-usage
 
 go 1.26.0
 

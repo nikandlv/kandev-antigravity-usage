@@ -84,14 +84,14 @@ test("uses Action once when the host exports it", async () => {
   const loaded = await loadPlugin({ action: Action });
   const control = composerComponent(loaded.components)({ slotProps: { taskTitle: "Example task" } });
 
-  assert.equal(loaded.pluginId, "kandev-plugin-template");
+  assert.equal(loaded.pluginId, "kandev-antigravity-usage");
   assert.equal(control.type, Action);
-  assert.equal(control.props.id, "template-chat-action");
-  assert.equal(control.props.label, "localized:openTemplatePage:Template — open page");
-  assert.match(control.props.tooltip, /Example task/);
+  assert.equal(control.props.id, "antigravity-usage-chat-action");
+  assert.equal(control.props.label, "localized:openAntigravityUsage:Antigravity Usage — View agent quotas");
+  assert.match(control.props.tooltip, /Antigravity Usage/);
   assert.equal(findNodes(control, "Button").length, 0);
   control.props.onClick();
-  assert.deepEqual(loaded.navigations, ["/template"]);
+  assert.deepEqual(loaded.navigations, ["/antigravity-usage"]);
 });
 
 test("keeps one legacy Button path on a host without Action or i18n", async () => {
@@ -99,12 +99,12 @@ test("keeps one legacy Button path on a host without Action or i18n", async () =
   const control = composerComponent(loaded.components)({ slotProps: { taskId: "task-123" } });
   const buttons = findNodes(control, "Button");
 
-  assert.equal(loaded.pluginId, "kandev-plugin-template");
+  assert.equal(loaded.pluginId, "kandev-antigravity-usage");
   assert.equal(control.type, "Tooltip");
   assert.equal(buttons.length, 1);
-  assert.equal(buttons[0].props.id, "template-chat-action");
-  assert.match(buttons[0].props["aria-label"], /task-123/);
+  assert.equal(buttons[0].props.id, "antigravity-usage-chat-action");
+  assert.match(buttons[0].props["aria-label"], /Antigravity Usage/);
   assert.equal(findNodes(control, "Action").length, 0);
   buttons[0].props.onClick();
-  assert.deepEqual(loaded.navigations, ["/template"]);
+  assert.deepEqual(loaded.navigations, ["/antigravity-usage"]);
 });

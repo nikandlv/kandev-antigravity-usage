@@ -2,106 +2,530 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/kandev/kandev/pkg/pluginsdk"
 )
 
-// eventCountStateKey is the Host state key this template uses to demonstrate
-// the GetState/SetState round trip: every task.created delivery increments a
-// persistent counter kept in kandev's state store, scoped to this plugin
-// instance. Delete this (and OnEvent) if your plugin doesn't handle events.
-const eventCountStateKey = "event_count"
+// Action keys declared in manifest.yaml
+const (
+	ActionProfilesList  = "profiles.list"
+	ActionProfilesUsage = "profiles.usage"
+	WebhookUsage        = "usage"
+)
 
-// templatePlugin implements pluginsdk.Plugin (via UnimplementedPlugin). It is
-// the one type you customize on the backend side: embed UnimplementedPlugin
-// for no-op defaults, then override only the RPCs you need
-// (OnEvent / HandleWebhook). Rename it to match your plugin.
-type templatePlugin struct {
+// ProfileInfo represents an Antigravity agent profile found under ~/.agx
+type ProfileInfo struct {
+	InstanceName string `json:"instance_name"`
+	AgentID      string `json:"agent_id,omitempty"`
+	Role         string `json:"role,omitempty"`
+	Avatar       string `json:"avatar,omitempty"`
+	HomeDir      string `json:"home_dir"`
+}
+
+// BucketUsage represents a single quota bucket (e.g. weekly or 5-hour limit).
+type BucketUsage struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Description       string  `json:"description,omitempty"`
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remaining_fraction"`
+	RemainingPercent  int     `json:"remaining_percent"`
+	ResetTime         string  `json:"reset_time,omitempty"`
+	Disabled          bool    `json:"disabled,omitempty"`
+}
+
+// GroupUsage represents a model group (e.g. Gemini Models, Claude & GPT models).
+type GroupUsage struct {
+	Name        string        `json:"name"`
+	Description string        `json:"description,omitempty"`
+	Buckets     []BucketUsage `json:"buckets"`
+}
+
+// ProfileUsage holds the full usage and quota information for an agent profile.
+type ProfileUsage struct {
+	Profile     ProfileInfo  `json:"profile"`
+	Groups      []GroupUsage `json:"groups"`
+	Description string       `json:"description,omitempty"`
+	FetchedAt   string       `json:"fetched_at"`
+	Error       string       `json:"error,omitempty"`
+}
+
+// AggregateBucket summarizes quotas across all available profiles.
+type AggregateBucket struct {
+	GroupName    string  `json:"group_name"`
+	Window       string  `json:"window"`
+	BucketName   string  `json:"bucket_name"`
+	Instances    int     `json:"instances"`
+	AvgRemaining float64 `json:"avg_remaining"`
+	AvgPercent   int     `json:"avg_percent"`
+}
+
+// UsageResponse is the full payload returned to the UI and webhooks.
+type UsageResponse struct {
+	Profiles   []ProfileUsage    `json:"profiles"`
+	Aggregates []AggregateBucket `json:"aggregates"`
+	FetchedAt  string            `json:"fetched_at"`
+	Error      string            `json:"error,omitempty"`
+}
+
+// ProfileListResponse is returned for ActionProfilesList.
+type ProfileListResponse struct {
+	Profiles []ProfileInfo `json:"profiles"`
+	Error    string        `json:"error,omitempty"`
+}
+
+// commandRunner abstracts CLI execution for testing.
+type commandRunner func(ctx context.Context, name string, args []string, env []string) ([]byte, error)
+
+func defaultCommandRunner(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = env
+	return cmd.Output()
+}
+
+type antigravityUsagePlugin struct {
 	pluginsdk.UnimplementedPlugin
+	runner commandRunner
 }
 
-var _ pluginsdk.Plugin = (*templatePlugin)(nil)
+var (
+	_ pluginsdk.Plugin        = (*antigravityUsagePlugin)(nil)
+	_ pluginsdk.ActionHandler = (*antigravityUsagePlugin)(nil)
+)
 
-// OnEvent is called for every event type declared in manifest.yaml's
-// capabilities.events. Here it logs the delivery and, when a Host has been
-// injected, increments a persistent counter through Host state. Returning an
-// error asks kandev to retry the delivery; return nil to acknowledge.
-func (p *templatePlugin) OnEvent(ctx context.Context, e *pluginsdk.Event) error {
-	log.Printf("event delivered: type=%s id=%s", e.EventType, e.EventID)
-
-	host := p.Host()
-	if host == nil {
-		// Host not injected yet (e.g. the broker dial is still in
-		// progress) — nothing more to do for this delivery.
-		return nil
+func newAntigravityUsagePlugin() *antigravityUsagePlugin {
+	return &antigravityUsagePlugin{
+		runner: defaultCommandRunner,
 	}
-
-	count, err := incrementEventCount(ctx, host)
-	if err != nil {
-		return fmt.Errorf("kandev-plugin-template: updating event count in Host state: %w", err)
-	}
-	log.Printf("events counted via Host state: %d", count)
-	return nil
 }
 
-// incrementEventCount reads the current count from Host state (0 if unset),
-// writes back count+1, and returns the new count. Note numbers come back from
-// Host state as float64 (the values round-trip through a protobuf Struct on
-// the wire), so read them as float64 before converting.
-func incrementEventCount(ctx context.Context, host pluginsdk.Host) (int, error) {
-	value, found, err := host.GetState(ctx, "instance", "", eventCountStateKey)
-	if err != nil {
-		return 0, fmt.Errorf("reading %s: %w", eventCountStateKey, err)
+// HandleAction dispatches declared browser actions.
+func (p *antigravityUsagePlugin) HandleAction(ctx context.Context, req *pluginsdk.PluginActionRequest) (*pluginsdk.PluginActionResponse, error) {
+	if req == nil {
+		return nil, errors.New("antigravity-usage: action request is required")
 	}
 
-	count := 0
-	if found {
-		if c, ok := value["count"].(float64); ok {
-			count = int(c)
+	agxDir := p.resolveAgxDir(ctx)
+	agyBin := p.resolveAgyBin(ctx)
+
+	switch req.ActionKey {
+	case ActionProfilesList:
+		profiles, err := p.discoverProfiles(agxDir)
+		if err != nil {
+			respBytes, _ := json.Marshal(ProfileListResponse{Error: err.Error()})
+			return &pluginsdk.PluginActionResponse{
+				Status: 200,
+				Body:   respBytes,
+			}, nil
+		}
+		respBytes, _ := json.Marshal(ProfileListResponse{Profiles: profiles})
+		return &pluginsdk.PluginActionResponse{
+			Status: 200,
+			Body:   respBytes,
+		}, nil
+
+	case ActionProfilesUsage:
+		var filter struct {
+			Instance string `json:"instance"`
+		}
+		if len(req.Body) > 0 {
+			_ = json.Unmarshal(req.Body, &filter)
+		}
+
+		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, filter.Instance)
+		respBytes, err := json.Marshal(usageResp)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling usage response: %w", err)
+		}
+		return &pluginsdk.PluginActionResponse{
+			Status: 200,
+			Body:   respBytes,
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("antigravity-usage: unknown action %q", req.ActionKey)
+	}
+}
+
+// HandleWebhook dispatches webhooks declared in manifest.yaml.
+func (p *antigravityUsagePlugin) HandleWebhook(ctx context.Context, req *pluginsdk.WebhookRequest) (*pluginsdk.WebhookResponse, error) {
+	if req == nil {
+		return nil, errors.New("antigravity-usage: webhook request is required")
+	}
+
+	switch req.WebhookKey {
+	case WebhookUsage:
+		agxDir := p.resolveAgxDir(ctx)
+		agyBin := p.resolveAgyBin(ctx)
+		usageResp := p.fetchAllUsages(ctx, agxDir, agyBin, "")
+		body, err := json.Marshal(usageResp)
+		if err != nil {
+			return nil, fmt.Errorf("marshalling usage response: %w", err)
+		}
+		return &pluginsdk.WebhookResponse{
+			Status: 200,
+			Body:   body,
+		}, nil
+
+	default:
+		return &pluginsdk.WebhookResponse{
+			Status: 404,
+			Body:   []byte(`{"error":"webhook not found"}`),
+		}, nil
+	}
+}
+
+// resolveAgxDir determines the path to ~/.agx.
+func (p *antigravityUsagePlugin) resolveAgxDir(ctx context.Context) string {
+	if host := p.Host(); host != nil {
+		if cfg, err := host.GetConfig(ctx); err == nil {
+			if dir, ok := cfg["agx_dir"].(string); ok && strings.TrimSpace(dir) != "" {
+				return expandPath(strings.TrimSpace(dir))
+			}
 		}
 	}
-	count++
-
-	if err := host.SetState(ctx, "instance", "", eventCountStateKey, map[string]any{"count": count}); err != nil {
-		return 0, fmt.Errorf("writing %s: %w", eventCountStateKey, err)
-	}
-	return count, nil
-}
-
-// HandleWebhook implements the webhooks declared in manifest.yaml. kandev
-// proxies POST /api/plugins/<id>/webhooks/<key> here; dispatch on
-// req.WebhookKey and return the status/body kandev should send back. This one
-// answers with a greeting built from the operator-configured settings, to
-// show a config read end to end.
-func (p *templatePlugin) HandleWebhook(ctx context.Context, req *pluginsdk.WebhookRequest) (*pluginsdk.WebhookResponse, error) {
-	log.Printf("webhook received: key=%s method=%s body=%s", req.WebhookKey, req.Method, string(req.Body))
-	body := fmt.Sprintf("%s, webhook!", p.greeting(ctx))
-	return &pluginsdk.WebhookResponse{Status: 200, Body: []byte(body)}, nil
-}
-
-// greeting reads this plugin's operator-editable settings through the Host
-// GetConfig RPC — the values saved on the plugin's settings page (the
-// manifest's config_schema). kandev restarts the plugin process whenever the
-// operator saves, so reading on demand always observes the current values.
-// Config is best-effort here: with no Host injected yet, or on an RPC error,
-// the greeting falls back to "Hello". A secret field like api_token arrives
-// in cleartext through this same call — the only surface where its real value
-// is visible.
-func (p *templatePlugin) greeting(ctx context.Context) string {
-	const fallback = "Hello"
-	host := p.Host()
-	if host == nil {
-		return fallback
-	}
-	config, err := host.GetConfig(ctx)
+	home, err := os.UserHomeDir()
 	if err != nil {
-		log.Printf("reading plugin config: %v", err)
-		return fallback
+		home = os.Getenv("HOME")
 	}
-	if greeting, _ := config["greeting"].(string); greeting != "" {
-		return greeting
+	return filepath.Join(home, ".agx")
+}
+
+// resolveAgyBin determines the path to the agy binary.
+func (p *antigravityUsagePlugin) resolveAgyBin(ctx context.Context) string {
+	if host := p.Host(); host != nil {
+		if cfg, err := host.GetConfig(ctx); err == nil {
+			if bin, ok := cfg["agy_binary"].(string); ok && strings.TrimSpace(bin) != "" {
+				return expandPath(strings.TrimSpace(bin))
+			}
+		}
 	}
-	return fallback
+
+	// Auto-detect candidates
+	candidates := []string{
+		"/opt/homebrew/bin/agy",
+		"/usr/local/bin/agy",
+		filepath.Join(os.Getenv("HOME"), ".bin", "agy"),
+	}
+	for _, candidate := range candidates {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+
+	if lookPath, err := exec.LookPath("agy"); err == nil {
+		return lookPath
+	}
+
+	return "agy"
+}
+
+func expandPath(p string) string {
+	if strings.HasPrefix(p, "~/") {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			home = os.Getenv("HOME")
+		}
+		return filepath.Join(home, p[2:])
+	}
+	return os.ExpandEnv(p)
+}
+
+// discoverProfiles finds all profile directories in agxDir.
+func (p *antigravityUsagePlugin) discoverProfiles(agxDir string) ([]ProfileInfo, error) {
+	entries, err := os.ReadDir(agxDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("agx directory does not exist: %s", agxDir)
+		}
+		return nil, fmt.Errorf("reading agx directory: %w", err)
+	}
+
+	var profiles []ProfileInfo
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		instanceName := entry.Name()
+		profileDir := filepath.Join(agxDir, instanceName)
+
+		profile := ProfileInfo{
+			InstanceName: instanceName,
+			HomeDir:      profileDir,
+			Role:         fmt.Sprintf("%s Specialist", instanceName),
+		}
+
+		// Read board_agent.json if present
+		agentJSONPath := filepath.Join(profileDir, "board_agent.json")
+		if data, err := os.ReadFile(agentJSONPath); err == nil {
+			var parsed struct {
+				InstanceName string `json:"instance_name"`
+				AgentID      string `json:"agent_id"`
+				Role         string `json:"role"`
+				Avatar       string `json:"avatar"`
+			}
+			if err := json.Unmarshal(data, &parsed); err == nil {
+				if parsed.InstanceName != "" {
+					profile.InstanceName = parsed.InstanceName
+				}
+				if parsed.AgentID != "" {
+					profile.AgentID = parsed.AgentID
+				}
+				if parsed.Role != "" {
+					profile.Role = parsed.Role
+				}
+				if parsed.Avatar != "" {
+					profile.Avatar = parsed.Avatar
+				}
+			}
+		}
+
+		profiles = append(profiles, profile)
+	}
+
+	sort.Slice(profiles, func(i, j int) bool {
+		return profiles[i].InstanceName < profiles[j].InstanceName
+	})
+
+	return profiles, nil
+}
+
+type agyRawBucket struct {
+	ID                string  `json:"id"`
+	Name              string  `json:"name"`
+	Description       string  `json:"description"`
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetTime         string  `json:"reset_time"`
+	Disabled          bool    `json:"disabled"`
+}
+
+type agyRawGroup struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Buckets     []agyRawBucket `json:"buckets"`
+}
+
+type agyRawData struct {
+	Description string        `json:"description"`
+	Groups      []agyRawGroup `json:"groups"`
+}
+
+type agyRawCommand struct {
+	Name string     `json:"name"`
+	Data agyRawData `json:"data"`
+}
+
+type agyRawOutput struct {
+	Status  string        `json:"status"`
+	Command agyRawCommand `json:"command"`
+	Error   string        `json:"error"`
+}
+
+// fetchUsageForProfile queries agy for a single profile.
+func (p *antigravityUsagePlugin) fetchUsageForProfile(ctx context.Context, agyBin string, profile ProfileInfo) ProfileUsage {
+	fetchedAt := time.Now().UTC().Format(time.RFC3339)
+	result := ProfileUsage{
+		Profile:   profile,
+		FetchedAt: fetchedAt,
+	}
+
+	env := cleanEnvForProfile(profile.HomeDir)
+	args := []string{"-p", "/usage", "--disable-slash-commands=false", "--output-format", "json"}
+
+	// 20-second timeout per individual query
+	queryCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	output, err := p.runner(queryCtx, agyBin, args, env)
+	if err != nil {
+		result.Error = fmt.Sprintf("failed running %s for %s: %v", agyBin, profile.InstanceName, err)
+		return result
+	}
+
+	var raw agyRawOutput
+	if err := json.Unmarshal(output, &raw); err != nil {
+		result.Error = fmt.Sprintf("invalid JSON output from agy: %v", err)
+		return result
+	}
+
+	if raw.Error != "" {
+		result.Error = raw.Error
+		return result
+	}
+
+	result.Description = raw.Command.Data.Description
+	for _, group := range raw.Command.Data.Groups {
+		g := GroupUsage{
+			Name:        group.Name,
+			Description: group.Description,
+		}
+		for _, b := range group.Buckets {
+			remPct := int(math.Round(b.RemainingFraction * 100))
+			if b.Disabled {
+				// When disabled due to quota depletion, indicate 0%
+				remPct = 0
+			}
+			g.Buckets = append(g.Buckets, BucketUsage{
+				ID:                b.ID,
+				Name:              b.Name,
+				Description:       b.Description,
+				Window:            b.Window,
+				RemainingFraction: b.RemainingFraction,
+				RemainingPercent:  remPct,
+				ResetTime:         b.ResetTime,
+				Disabled:          b.Disabled,
+			})
+		}
+		result.Groups = append(result.Groups, g)
+	}
+
+	return result
+}
+
+// cleanEnvForProfile prepares environment variables for agy execution.
+func cleanEnvForProfile(homeDir string) []string {
+	var env []string
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "HOME=") {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env, "HOME="+homeDir)
+	return env
+}
+
+// fetchAllUsages retrieves usage for all or filtered profiles.
+func (p *antigravityUsagePlugin) fetchAllUsages(ctx context.Context, agxDir, agyBin string, filterInstance string) UsageResponse {
+	fetchedAt := time.Now().UTC().Format(time.RFC3339)
+	profiles, err := p.discoverProfiles(agxDir)
+	if err != nil {
+		return UsageResponse{
+			FetchedAt: fetchedAt,
+			Error:     err.Error(),
+		}
+	}
+
+	if filterInstance != "" {
+		var matched []ProfileInfo
+		for _, prof := range profiles {
+			if strings.EqualFold(prof.InstanceName, filterInstance) {
+				matched = append(matched, prof)
+				break
+			}
+		}
+		if len(matched) == 0 {
+			return UsageResponse{
+				FetchedAt: fetchedAt,
+				Error:     fmt.Sprintf("profile %q not found", filterInstance),
+			}
+		}
+		profiles = matched
+	}
+
+	// Fetch concurrently
+	results := make([]ProfileUsage, len(profiles))
+	var wg sync.WaitGroup
+
+	// Concurrency limiter
+	sem := make(chan struct{}, 6)
+
+	for i, prof := range profiles {
+		wg.Add(1)
+		go func(idx int, pi ProfileInfo) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			results[idx] = p.fetchUsageForProfile(ctx, agyBin, pi)
+		}(i, prof)
+	}
+
+	wg.Wait()
+
+	aggregates := computeAggregates(results)
+
+	return UsageResponse{
+		Profiles:   results,
+		Aggregates: aggregates,
+		FetchedAt:  fetchedAt,
+	}
+}
+
+// computeAggregates calculates group/window average percentages.
+func computeAggregates(profiles []ProfileUsage) []AggregateBucket {
+	type bucketKey struct {
+		GroupName  string
+		Window     string
+		BucketName string
+	}
+
+	type bucketStat struct {
+		sumFraction float64
+		count       int
+	}
+
+	stats := make(map[bucketKey]*bucketStat)
+	var orderedKeys []bucketKey
+
+	for _, pu := range profiles {
+		if pu.Error != "" {
+			continue
+		}
+		for _, g := range pu.Groups {
+			for _, b := range g.Buckets {
+				key := bucketKey{
+					GroupName:  g.Name,
+					Window:     b.Window,
+					BucketName: b.Name,
+				}
+				stat, exists := stats[key]
+				if !exists {
+					stat = &bucketStat{}
+					stats[key] = stat
+					orderedKeys = append(orderedKeys, key)
+				}
+				stat.count++
+				if b.Disabled {
+					stat.sumFraction += 0.0
+				} else {
+					stat.sumFraction += b.RemainingFraction
+				}
+			}
+		}
+	}
+
+	var aggregates []AggregateBucket
+	for _, key := range orderedKeys {
+		stat := stats[key]
+		avg := 0.0
+		avgPct := 0
+		if stat.count > 0 {
+			avg = stat.sumFraction / float64(stat.count)
+			avgPct = int(math.Round(avg * 100))
+		}
+		aggregates = append(aggregates, AggregateBucket{
+			GroupName:    key.GroupName,
+			Window:       key.Window,
+			BucketName:   key.BucketName,
+			Instances:    stat.count,
+			AvgRemaining: avg,
+			AvgPercent:   avgPct,
+		})
+	}
+
+	return aggregates
 }

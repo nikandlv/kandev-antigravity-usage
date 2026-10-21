@@ -1,167 +1,355 @@
-// Package main tests. Exercises templatePlugin's Plugin methods (OnEvent and
-// HandleWebhook) via direct calls against a fakeHost — no
-// go-plugin subprocess needed. This is the fast, hermetic way to test a
-// kandev plugin's backend half; copy the fakeHost pattern for your own tests.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sync"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/kandev/kandev/pkg/pluginsdk"
 	"github.com/stretchr/testify/require"
 )
 
-// fakeHost is an in-memory pluginsdk.Host test double that actually stores
-// state (unlike a call-recording spy), so tests can assert the
-// get-then-increment-then-set round trip. SetState round-trips values through
-// JSON, mirroring the real Host's protobuf Struct conversion: numbers always
-// come back as float64, never the original Go numeric type — a fake that just
-// stored the raw Go value would hide bugs like reading a JSON number as int.
-// UnimplementedHostData satisfies the Host data API accessors this plugin
-// doesn't use.
+const sampleAgyJSON = `{
+  "status": "SUCCESS",
+  "command": {
+    "name": "usage",
+    "data": {
+      "description": "Shared weekly and 5-hour limit.",
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "description": "Gemini Flash, Gemini Pro",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "name": "Weekly Limit Remaining",
+              "description": "Weekly refresh",
+              "window": "weekly",
+              "remaining_fraction": 0.85,
+              "reset_time": "2026-10-26T19:07:15Z"
+            },
+            {
+              "id": "gemini-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 0.50,
+              "reset_time": "2026-10-21T12:26:08Z"
+            }
+          ]
+        },
+        {
+          "name": "Claude and GPT models",
+          "description": "Claude and GPT",
+          "buckets": [
+            {
+              "id": "3p-weekly",
+              "name": "Weekly Limit Remaining",
+              "window": "weekly",
+              "remaining_fraction": 1.0,
+              "reset_time": "2026-10-28T09:16:12Z"
+            },
+            {
+              "id": "3p-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 1.0,
+              "reset_time": "2026-10-21T14:16:12Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}`
+
+const sampleDisabledAgyJSON = `{
+  "status": "SUCCESS",
+  "command": {
+    "name": "usage",
+    "data": {
+      "description": "Depleted weekly quota.",
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "name": "Weekly Limit Remaining",
+              "window": "weekly",
+              "remaining_fraction": 0.0,
+              "reset_time": "2026-10-24T06:41:54Z"
+            },
+            {
+              "id": "gemini-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "disabled": true,
+              "remaining_fraction": 1.0
+            }
+          ]
+        }
+      ]
+    }
+  }
+}`
+
+func createMockAgxDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+
+	// Instance 1: kurtis (with board_agent.json)
+	kurtisDir := filepath.Join(dir, "kurtis")
+	require.NoError(t, os.MkdirAll(kurtisDir, 0755))
+	boardData := map[string]string{
+		"instance_name": "kurtis",
+		"agent_id":      "kurtis-uuid-123",
+		"role":          "Autonomous Planner",
+		"avatar":        "https://example.com/kurtis.svg",
+	}
+	bytes, _ := json.Marshal(boardData)
+	require.NoError(t, os.WriteFile(filepath.Join(kurtisDir, "board_agent.json"), bytes, 0644))
+
+	// Instance 2: jim (without board_agent.json)
+	jimDir := filepath.Join(dir, "jim")
+	require.NoError(t, os.MkdirAll(jimDir, 0755))
+
+	// Non-profile hidden dir
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, ".hidden"), 0755))
+
+	return dir
+}
+
+// fakeHost satisfies pluginsdk.Host for testing.
 type fakeHost struct {
 	pluginsdk.UnimplementedHostData
-	mu     sync.Mutex
-	state  map[string]map[string]any
 	config map[string]any
 }
 
-func newFakeHost() *fakeHost {
-	return &fakeHost{state: make(map[string]map[string]any)}
-}
-
-func stateKey(scope, scopeID, key string) string {
-	return scope + "/" + scopeID + "/" + key
-}
-
-func (h *fakeHost) GetState(_ context.Context, scope, scopeID, key string) (map[string]any, bool, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	v, ok := h.state[stateKey(scope, scopeID, key)]
-	return v, ok, nil
-}
-
-func (h *fakeHost) SetState(_ context.Context, scope, scopeID, key string, value map[string]any) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.state[stateKey(scope, scopeID, key)] = jsonRoundTrip(value)
-	return nil
-}
-
-// jsonRoundTrip marshals v to JSON and back into map[string]any, so numeric
-// values normalize to float64 exactly like structpb.Struct.AsMap() does on
-// the real wire.
-func jsonRoundTrip(v map[string]any) map[string]any {
-	data, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	var out map[string]any
-	if err := json.Unmarshal(data, &out); err != nil {
-		panic(err)
-	}
-	return out
-}
-
-func (h *fakeHost) DeleteState(context.Context, string, string, string) error { return nil }
-
-func (h *fakeHost) ListState(context.Context, string, string) ([]pluginsdk.StateEntry, error) {
-	return nil, nil
-}
-
-// GetConfig returns the operator-saved settings the real Host reads from
-// kandev's plugin config store.
 func (h *fakeHost) GetConfig(context.Context) (map[string]any, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.config == nil {
 		return map[string]any{}, nil
 	}
 	return h.config, nil
 }
 
-func (h *fakeHost) RevealSecret(context.Context, string) (string, error) { return "", nil }
-
-func (h *fakeHost) GetSecret(context.Context, string) (string, bool, error) {
-	return "", false, nil
+func (h *fakeHost) GetState(context.Context, string, string, string) (map[string]any, bool, error) {
+	return nil, false, nil
 }
-func (h *fakeHost) SetSecret(context.Context, string, string) error { return nil }
-func (h *fakeHost) DeleteSecret(context.Context, string) error      { return nil }
-
+func (h *fakeHost) SetState(context.Context, string, string, string, map[string]any) error {
+	return nil
+}
+func (h *fakeHost) DeleteState(context.Context, string, string, string) error { return nil }
+func (h *fakeHost) ListState(context.Context, string, string) ([]pluginsdk.StateEntry, error) {
+	return nil, nil
+}
+func (h *fakeHost) RevealSecret(context.Context, string) (string, error)    { return "", nil }
+func (h *fakeHost) GetSecret(context.Context, string) (string, bool, error) { return "", false, nil }
+func (h *fakeHost) SetSecret(context.Context, string, string) error         { return nil }
+func (h *fakeHost) DeleteSecret(context.Context, string) error              { return nil }
 func (h *fakeHost) EmitEvent(context.Context, string, map[string]any) error { return nil }
 
-var _ pluginsdk.Host = (*fakeHost)(nil)
+func TestDiscoverProfiles(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
 
-func TestOnEvent_NoHost_ReturnsNilWithoutPanicking(t *testing.T) {
-	p := &templatePlugin{}
-	err := p.OnEvent(context.Background(), &pluginsdk.Event{EventID: "e1", EventType: "task.created"})
+	profiles, err := p.discoverProfiles(agxDir)
 	require.NoError(t, err)
+	require.Len(t, profiles, 2)
+
+	require.Equal(t, "jim", profiles[0].InstanceName)
+	require.Equal(t, "jim Specialist", profiles[0].Role)
+
+	require.Equal(t, "kurtis", profiles[1].InstanceName)
+	require.Equal(t, "Autonomous Planner", profiles[1].Role)
+	require.Equal(t, "kurtis-uuid-123", profiles[1].AgentID)
+	require.Equal(t, "https://example.com/kurtis.svg", profiles[1].Avatar)
 }
 
-func TestOnEvent_IncrementsEventCountViaHostState(t *testing.T) {
-	p := &templatePlugin{}
-	host := newFakeHost()
+func TestFetchUsageForProfile_Success(t *testing.T) {
+	p := newAntigravityUsagePlugin()
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		require.Equal(t, "mock-agy", name)
+		require.Contains(t, args, "/usage")
+		return []byte(sampleAgyJSON), nil
+	}
+
+	profile := ProfileInfo{
+		InstanceName: "kurtis",
+		HomeDir:      "/tmp/agx/kurtis",
+	}
+
+	usage := p.fetchUsageForProfile(context.Background(), "mock-agy", profile)
+	require.Empty(t, usage.Error)
+	require.Equal(t, "kurtis", usage.Profile.InstanceName)
+	require.Len(t, usage.Groups, 2)
+
+	gemini := usage.Groups[0]
+	require.Equal(t, "Gemini Models", gemini.Name)
+	require.Len(t, gemini.Buckets, 2)
+	require.Equal(t, 85, gemini.Buckets[0].RemainingPercent)
+	require.Equal(t, 50, gemini.Buckets[1].RemainingPercent)
+
+	claude := usage.Groups[1]
+	require.Equal(t, "Claude and GPT models", claude.Name)
+	require.Equal(t, 100, claude.Buckets[0].RemainingPercent)
+}
+
+func TestFetchUsageForProfile_DisabledBucket(t *testing.T) {
+	p := newAntigravityUsagePlugin()
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		return []byte(sampleDisabledAgyJSON), nil
+	}
+
+	profile := ProfileInfo{
+		InstanceName: "jim",
+		HomeDir:      "/tmp/agx/jim",
+	}
+
+	usage := p.fetchUsageForProfile(context.Background(), "mock-agy", profile)
+	require.Empty(t, usage.Error)
+	require.Len(t, usage.Groups, 1)
+
+	gemini := usage.Groups[0]
+	require.Len(t, gemini.Buckets, 2)
+	require.Equal(t, 0, gemini.Buckets[0].RemainingPercent)
+	require.True(t, gemini.Buckets[1].Disabled)
+	require.Equal(t, 0, gemini.Buckets[1].RemainingPercent)
+}
+
+func TestFetchUsageForProfile_CommandError(t *testing.T) {
+	p := newAntigravityUsagePlugin()
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		return nil, errors.New("exec error: process exited 1")
+	}
+
+	profile := ProfileInfo{
+		InstanceName: "ramon",
+		HomeDir:      "/tmp/agx/ramon",
+	}
+
+	usage := p.fetchUsageForProfile(context.Background(), "mock-agy", profile)
+	require.NotEmpty(t, usage.Error)
+	require.Contains(t, usage.Error, "exec error")
+}
+
+func TestHandleAction_ProfilesList(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
+	host := &fakeHost{
+		config: map[string]any{"agx_dir": agxDir},
+	}
 	p.SetHost(host)
 
-	require.NoError(t, p.OnEvent(context.Background(), &pluginsdk.Event{EventID: "e1", EventType: "task.created"}))
-	value, found, err := host.GetState(context.Background(), "instance", "", eventCountStateKey)
+	resp, err := p.HandleAction(context.Background(), &pluginsdk.PluginActionRequest{
+		ActionKey: ActionProfilesList,
+		Context:   pluginsdk.VerifiedActionContext{WorkspaceID: "ws-1"},
+	})
 	require.NoError(t, err)
-	require.True(t, found)
-	require.InEpsilon(t, float64(1), value["count"], 0)
+	require.Equal(t, 200, resp.Status)
 
-	require.NoError(t, p.OnEvent(context.Background(), &pluginsdk.Event{EventID: "e2", EventType: "task.created"}))
-	value, found, err = host.GetState(context.Background(), "instance", "", eventCountStateKey)
+	var listResp ProfileListResponse
+	require.NoError(t, json.Unmarshal(resp.Body, &listResp))
+	require.Len(t, listResp.Profiles, 2)
+}
+
+func TestHandleAction_ProfilesUsage(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
+	host := &fakeHost{
+		config: map[string]any{
+			"agx_dir":    agxDir,
+			"agy_binary": "mock-agy",
+		},
+	}
+	p.SetHost(host)
+
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		return []byte(sampleAgyJSON), nil
+	}
+
+	resp, err := p.HandleAction(context.Background(), &pluginsdk.PluginActionRequest{
+		ActionKey: ActionProfilesUsage,
+		Context:   pluginsdk.VerifiedActionContext{WorkspaceID: "ws-1"},
+	})
 	require.NoError(t, err)
-	require.True(t, found)
-	require.InEpsilon(t, float64(2), value["count"], 0)
+	require.Equal(t, 200, resp.Status)
+
+	var usageResp UsageResponse
+	require.NoError(t, json.Unmarshal(resp.Body, &usageResp))
+	require.Len(t, usageResp.Profiles, 2)
+	require.NotEmpty(t, usageResp.Aggregates)
+
+	// Check aggregate computation
+	var geminiWeeklyAgg *AggregateBucket
+	for _, agg := range usageResp.Aggregates {
+		if agg.GroupName == "Gemini Models" && agg.Window == "weekly" {
+			geminiWeeklyAgg = &agg
+			break
+		}
+	}
+	require.NotNil(t, geminiWeeklyAgg)
+	require.Equal(t, 2, geminiWeeklyAgg.Instances)
+	require.Equal(t, 85, geminiWeeklyAgg.AvgPercent)
 }
 
-// errHost fails every SetState call, to prove OnEvent surfaces a Host write
-// failure rather than silently swallowing it.
-type errHost struct {
-	fakeHost
+func TestHandleAction_FilterInstance(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
+	host := &fakeHost{
+		config: map[string]any{"agx_dir": agxDir},
+	}
+	p.SetHost(host)
+
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		return []byte(sampleAgyJSON), nil
+	}
+
+	body, _ := json.Marshal(map[string]string{"instance": "kurtis"})
+	resp, err := p.HandleAction(context.Background(), &pluginsdk.PluginActionRequest{
+		ActionKey: ActionProfilesUsage,
+		Context:   pluginsdk.VerifiedActionContext{WorkspaceID: "ws-1"},
+		Body:      body,
+	})
+	require.NoError(t, err)
+
+	var usageResp UsageResponse
+	require.NoError(t, json.Unmarshal(resp.Body, &usageResp))
+	require.Len(t, usageResp.Profiles, 1)
+	require.Equal(t, "kurtis", usageResp.Profiles[0].Profile.InstanceName)
 }
 
-func (h *errHost) SetState(context.Context, string, string, string, map[string]any) error {
-	return errors.New("boom")
+func TestHandleWebhook_Usage(t *testing.T) {
+	agxDir := createMockAgxDir(t)
+	p := newAntigravityUsagePlugin()
+	host := &fakeHost{
+		config: map[string]any{"agx_dir": agxDir},
+	}
+	p.SetHost(host)
+
+	p.runner = func(ctx context.Context, name string, args []string, env []string) ([]byte, error) {
+		return []byte(sampleAgyJSON), nil
+	}
+
+	resp, err := p.HandleWebhook(context.Background(), &pluginsdk.WebhookRequest{
+		WebhookKey: WebhookUsage,
+		Method:     "POST",
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(200), resp.Status)
+
+	var usageResp UsageResponse
+	require.NoError(t, json.Unmarshal(resp.Body, &usageResp))
+	require.Len(t, usageResp.Profiles, 2)
 }
 
-func TestOnEvent_PropagatesHostSetStateError(t *testing.T) {
-	p := &templatePlugin{}
-	p.SetHost(&errHost{fakeHost: *newFakeHost()})
-
-	err := p.OnEvent(context.Background(), &pluginsdk.Event{EventID: "e1", EventType: "task.created"})
+func TestHandleAction_UnknownAction(t *testing.T) {
+	p := newAntigravityUsagePlugin()
+	_, err := p.HandleAction(context.Background(), &pluginsdk.PluginActionRequest{
+		ActionKey: "unknown.action",
+	})
 	require.Error(t, err)
-}
-
-func TestHandleWebhook_DefaultGreetingWithoutHost(t *testing.T) {
-	p := &templatePlugin{}
-
-	resp, err := p.HandleWebhook(context.Background(), &pluginsdk.WebhookRequest{
-		WebhookKey: "ping",
-		Method:     "POST",
-		Body:       []byte(`{"ping":true}`),
-	})
-	require.NoError(t, err)
-	require.Equal(t, int32(200), resp.Status)
-	require.Equal(t, "Hello, webhook!", string(resp.Body))
-}
-
-func TestHandleWebhook_UsesOperatorConfig(t *testing.T) {
-	p := &templatePlugin{}
-	host := newFakeHost()
-	host.config = map[string]any{"greeting": "Howdy", "api_token": "secret"}
-	p.SetHost(host)
-
-	resp, err := p.HandleWebhook(context.Background(), &pluginsdk.WebhookRequest{
-		WebhookKey: "ping",
-		Method:     "POST",
-	})
-	require.NoError(t, err)
-	require.Equal(t, int32(200), resp.Status)
-	require.Equal(t, "Howdy, webhook!", string(resp.Body))
+	require.Contains(t, err.Error(), "unknown action")
 }
